@@ -11,6 +11,8 @@ let searchTimeout;
 let activeTab = 'search';
 let lastKeyTime = 0;
 let lastKey = null;
+let lastReindexDate = null; // Track last reindex date
+let autoReindexEnabled = true; // Auto reindex enabled by default
 
 // Search options
 let searchOptions = {
@@ -93,6 +95,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     performSearch(searchInput.value.trim());
   });
   
+  // Auto reindex checkbox listener
+  document.getElementById("auto-reindex").addEventListener("change", (e) => {
+    autoReindexEnabled = e.target.checked;
+    localStorage.setItem('autoReindexEnabled', autoReindexEnabled);
+    console.log(`Auto reindex ${autoReindexEnabled ? 'enabled' : 'disabled'}`);
+  });
+  
+  // Load saved auto-reindex preference
+  const savedAutoReindex = localStorage.getItem('autoReindexEnabled');
+  if (savedAutoReindex !== null) {
+    autoReindexEnabled = savedAutoReindex === 'true';
+    document.getElementById("auto-reindex").checked = autoReindexEnabled;
+  }
+  
   // Setup tab listeners
   document.querySelectorAll(".tab-btn").forEach(btn => {
     btn.addEventListener("click", (e) => {
@@ -109,6 +125,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Auto-refresh status (less frequent to avoid development interruptions)
   setInterval(updateStatus, 15000);
+  
+  // Check for scheduled reindexing every hour
+  checkScheduledReindex();
+  setInterval(checkScheduledReindex, 60 * 60 * 1000); // Check every hour
 });
 
 // Switch between tabs
@@ -219,10 +239,15 @@ function renderSearchResults(results) {
   const html = results
     .map((file, index) => {
       const isSelected = index === selectedIndex && activeTab === 'search';
+      const ext = file.name.includes('.') ? file.name.split('.').pop().toUpperCase() : 'FILE';
 
       return `
         <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
-          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-info-row">
+            <div class="file-name">${escapeHtml(file.name)}</div>
+            <span class="file-ext-badge">${ext}</span>
+            <button class="open-with-btn" data-path="${escapeHtml(file.path)}" title="Open with...">⚙</button>
+          </div>
           <div class="file-path">${escapeHtml(file.path)}</div>
         </div>
       `;
@@ -231,11 +256,24 @@ function renderSearchResults(results) {
 
   resultsList.innerHTML = html;
 
-  // Add click listeners
+  // Add click listeners for file items
   resultsList.querySelectorAll(".file-item").forEach((item) => {
-    item.addEventListener("click", () => {
+    item.addEventListener("click", (e) => {
+      // Don't open if clicking the "Open with" button
+      if (e.target.classList.contains('open-with-btn')) {
+        return;
+      }
       const path = item.dataset.path;
       openFile(path);
+    });
+  });
+
+  // Add click listeners for "Open with" buttons
+  resultsList.querySelectorAll(".open-with-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      await showOpenWithDialog(path);
     });
   });
 
@@ -260,13 +298,18 @@ function renderRecentResults(results) {
   const html = results
     .map((file, index) => {
       const isSelected = index === selectedIndex && activeTab === 'recent';
+      const ext = file.name.includes('.') ? file.name.split('.').pop().toUpperCase() : 'FILE';
       const recentBadge = file.access_count > 1
         ? `<span class="recent-badge">Used ${file.access_count}x</span>`
         : '';
 
       return `
         <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
-          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-info-row">
+            <div class="file-name">${escapeHtml(file.name)}</div>
+            <span class="file-ext-badge">${ext}</span>
+            <button class="open-with-btn" data-path="${escapeHtml(file.path)}" title="Open with...">⚙</button>
+          </div>
           <div class="file-path">${escapeHtml(file.path)}</div>
           ${recentBadge ? `<div class="file-meta">${recentBadge}</div>` : ''}
         </div>
@@ -276,11 +319,23 @@ function renderRecentResults(results) {
 
   recentList.innerHTML = html;
 
-  // Add click listeners
+  // Add click listeners for file items
   recentList.querySelectorAll(".file-item").forEach((item) => {
-    item.addEventListener("click", () => {
+    item.addEventListener("click", (e) => {
+      if (e.target.classList.contains('open-with-btn')) {
+        return;
+      }
       const path = item.dataset.path;
       openFile(path);
+    });
+  });
+
+  // Add click listeners for "Open with" buttons
+  recentList.querySelectorAll(".open-with-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      await showOpenWithDialog(path);
     });
   });
 
@@ -403,6 +458,84 @@ async function openFile(path) {
   }
 }
 
+// Open file with specific program
+async function openFileWith(path, program) {
+  try {
+    await invoke("open_file_with", { path, program });
+    await loadRecentFiles();
+    showSuccess(`Opened with ${program}`);
+  } catch (error) {
+    console.error("Failed to open file:", error);
+    showError("Failed to open file: " + error);
+  }
+}
+
+// Show "Open with" dialog
+async function showOpenWithDialog(path) {
+  try {
+    const fileInfo = await invoke("get_file_info", { path });
+    const fileName = path.split(/[/\\]/).pop();
+    
+    // Create modal dialog
+    const modal = document.createElement('div');
+    modal.className = 'modal-overlay';
+    modal.innerHTML = `
+      <div class="modal-content">
+        <h3>Open "${fileName}"</h3>
+        <p class="modal-subtitle">File type: .${fileInfo.extension}</p>
+        <div class="program-list">
+          ${fileInfo.suggested_programs.map(program => `
+            <button class="program-btn" data-program="${program}">
+              <span class="program-icon">📝</span>
+              <span class="program-name">${program}</span>
+            </button>
+          `).join('')}
+        </div>
+        <div class="modal-actions">
+          <input type="text" id="custom-program" placeholder="Or enter custom program path..." class="custom-program-input" />
+          <div style="display: flex; gap: 8px; margin-top: 8px;">
+            <button class="btn-secondary" id="modal-cancel">Cancel</button>
+            <button class="btn-primary" id="modal-custom-open">Open with Custom</button>
+          </div>
+        </div>
+      </div>
+    `;
+    
+    document.body.appendChild(modal);
+    
+    // Add click handlers
+    modal.querySelectorAll('.program-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const program = btn.dataset.program;
+        document.body.removeChild(modal);
+        await openFileWith(path, program);
+      });
+    });
+    
+    modal.querySelector('#modal-cancel').addEventListener('click', () => {
+      document.body.removeChild(modal);
+    });
+    
+    modal.querySelector('#modal-custom-open').addEventListener('click', async () => {
+      const customProgram = modal.querySelector('#custom-program').value.trim();
+      if (customProgram) {
+        document.body.removeChild(modal);
+        await openFileWith(path, customProgram);
+      }
+    });
+    
+    // Close on overlay click
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        document.body.removeChild(modal);
+      }
+    });
+  } catch (error) {
+    console.error("Failed to get file info:", error);
+    showError("Failed to get file info: " + error);
+  }
+}
+
 // Start indexing
 async function startIndexing() {
   try {
@@ -436,6 +569,55 @@ async function updateStatus() {
   } catch (error) {
     console.error("Failed to get status:", error);
     indexStatusEl.textContent = "Status unavailable";
+  }
+}
+
+// Check if it's time for scheduled reindexing
+async function checkScheduledReindex() {
+  // Check if auto-reindex is enabled
+  if (!autoReindexEnabled) {
+    return;
+  }
+  
+  const now = new Date();
+  const hour = now.getHours();
+  const currentDate = now.toDateString();
+  
+  // Define nighttime as 2 AM to 5 AM (customize as needed)
+  const isNightTime = hour >= 2 && hour < 5;
+  
+  // Check if we already reindexed today
+  const alreadyReindexedToday = lastReindexDate === currentDate;
+  
+  if (isNightTime && !alreadyReindexedToday) {
+    console.log(`Scheduled reindex triggered at ${now.toLocaleTimeString()}`);
+    
+    try {
+      // Get current status to see if we have files indexed
+      const status = await invoke("get_index_status");
+      
+      if (status.total_files > 0) {
+        // Only reindex if we have existing files
+        console.log("Starting automatic nighttime reindex...");
+        await invoke("start_indexing");
+        lastReindexDate = currentDate;
+        
+        // Update status after a delay to show the new count
+        setTimeout(updateStatus, 5000);
+        
+        console.log("Automatic reindex completed successfully");
+      }
+    } catch (error) {
+      console.error("Scheduled reindex failed:", error);
+    }
+  }
+  
+  // If it's past 6 AM, reset the flag for next night
+  if (hour >= 6) {
+    if (lastReindexDate !== currentDate) {
+      // This means we didn't reindex last night, which is okay
+      lastReindexDate = null;
+    }
   }
 }
 

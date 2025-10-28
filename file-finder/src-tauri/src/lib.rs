@@ -786,6 +786,90 @@ async fn open_file(path: String, state: State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
+async fn open_file_with(path: String, program: String, state: State<'_, AppState>) -> Result<(), String> {
+    // Update recent files
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let now = Utc::now().timestamp();
+
+    let path_obj = PathBuf::from(&path);
+    let name = path_obj
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&path);
+
+    db.execute(
+        "INSERT INTO recent_files (path, name, last_accessed, access_count)
+         VALUES (?1, ?2, ?3, 1)
+         ON CONFLICT(path) DO UPDATE SET
+            last_accessed = ?3,
+            access_count = access_count + 1",
+        params![path, name, now],
+    )
+    .map_err(|e| e.to_string())?;
+
+    drop(db);
+
+    // Open file with specified program
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", "", &program, &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new(&program)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct FileInfo {
+    extension: String,
+    suggested_programs: Vec<String>,
+}
+
+#[tauri::command]
+async fn get_file_info(path: String) -> Result<FileInfo, String> {
+    let path_obj = PathBuf::from(&path);
+    let extension = path_obj
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Common program suggestions based on extension
+    let suggested_programs = match extension.as_str() {
+        "py" => vec!["notepad++.exe", "code.exe", "pycharm64.exe", "notepad.exe"],
+        "java" => vec!["notepad++.exe", "code.exe", "idea64.exe", "notepad.exe"],
+        "js" | "ts" | "jsx" | "tsx" => vec!["code.exe", "notepad++.exe", "webstorm64.exe", "notepad.exe"],
+        "txt" | "md" | "log" => vec!["notepad++.exe", "notepad.exe", "code.exe"],
+        "json" | "xml" | "yaml" | "yml" => vec!["notepad++.exe", "code.exe", "notepad.exe"],
+        "html" | "css" => vec!["code.exe", "notepad++.exe", "chrome.exe", "notepad.exe"],
+        "pdf" => vec!["AcroRd32.exe", "chrome.exe", "msedge.exe"],
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" => vec!["mspaint.exe", "PhotosApp.exe", "chrome.exe"],
+        "mp4" | "avi" | "mkv" => vec!["vlc.exe", "wmplayer.exe"],
+        "mp3" | "wav" | "flac" => vec!["vlc.exe", "wmplayer.exe"],
+        "zip" | "rar" | "7z" => vec!["7zFM.exe", "WinRAR.exe"],
+        "doc" | "docx" => vec!["WINWORD.EXE", "notepad.exe"],
+        "xls" | "xlsx" => vec!["EXCEL.EXE", "notepad.exe"],
+        "ppt" | "pptx" => vec!["POWERPNT.EXE"],
+        _ => vec!["notepad.exe", "code.exe", "notepad++.exe"],
+    };
+
+    Ok(FileInfo {
+        extension: extension.to_string(),
+        suggested_programs: suggested_programs.iter().map(|s| s.to_string()).collect(),
+    })
+}
+
+#[tauri::command]
 async fn get_index_status(state: State<'_, AppState>) -> Result<IndexStatus, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
@@ -825,6 +909,8 @@ pub fn run() {
             search_files,
             get_recent_files,
             open_file,
+            open_file_with,
+            get_file_info,
             get_index_status,
             debug_search,
             test_glob_pattern

@@ -11,6 +11,37 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 use regex::Regex;
 
+// Helper function to check if a file path is in a library/build directory
+fn is_library_file(path: &str) -> bool {
+    let path_l = path.to_lowercase();
+    path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
+    path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
+    path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
+    path_l.contains("/target/") || path_l.contains("\\target\\") ||
+    path_l.contains("/build/") || path_l.contains("\\build\\") ||
+    path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
+    path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
+    path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
+    path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
+    path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
+    path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
+    path_l.contains("/out/") || path_l.contains("\\out\\") ||
+    // Python/Anaconda library directories
+    path_l.contains("/anaconda3/") || path_l.contains("\\anaconda3\\") ||
+    path_l.contains("/miniconda3/") || path_l.contains("\\miniconda3\\") ||
+    path_l.contains("/pkgs/") || path_l.contains("\\pkgs\\") ||
+    path_l.contains("/envs/") || path_l.contains("\\envs\\") ||
+    path_l.contains("/lib/python") || path_l.contains("\\lib\\python") ||
+    // Jupyter/IPython directories
+    path_l.contains("/share/jupyter/") || path_l.contains("\\share\\jupyter\\") ||
+    path_l.contains("/jupyter/") || path_l.contains("\\jupyter\\") ||
+    path_l.contains("/ipython/") || path_l.contains("\\ipython\\") ||
+    // Other common library patterns
+    path_l.contains("/program files/") || path_l.contains("\\program files\\") ||
+    path_l.contains("/appdata/") || path_l.contains("\\appdata\\") ||
+    path_l.contains("/.cache/") || path_l.contains("\\.cache\\")
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
     pub path: String,
@@ -176,18 +207,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
         let path_l = path.to_lowercase();
 
         // Check if file is in a library/build directory (should be deprioritized)
-        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
-                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
-                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
-                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
-                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
-                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
-                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
-                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
-                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
-                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
-                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
-                               path_l.contains("/out/") || path_l.contains("\\out\\");
+        let is_in_library_dir = is_library_file(&path);
 
         // Helper: check if all tokens appear in order in a haystack string
         let in_order_in = |haystack: &str| -> Option<i64> {
@@ -406,19 +426,7 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                 let results: Vec<_> = files.into_iter()
                     .filter_map(|(path, name)| {
                         // Check if file is in a library/build directory
-                        let path_l = path.to_lowercase();
-                        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
-                                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
-                                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
-                                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
-                                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
-                                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
-                                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
-                                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
-                                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
-                                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
-                                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
-                                               path_l.contains("/out/") || path_l.contains("\\out\\");
+                        let is_in_library_dir = is_library_file(&path);
 
                         // Check regex match against filename, path components, and full path
                         let name_match = regex.is_match(&name);
@@ -496,19 +504,7 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                 files.into_iter()
                     .filter_map(|(path, name)| {
                         // Check if file is in a library/build directory
-                        let path_l = path.to_lowercase();
-                        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
-                                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
-                                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
-                                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
-                                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
-                                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
-                                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
-                                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
-                                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
-                                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
-                                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
-                                               path_l.contains("/out/") || path_l.contains("\\out\\");
+                        let is_in_library_dir = is_library_file(&path);
 
                         // Check regex match against filename, path components, and full path
                         let name_match = regex.is_match(&name);

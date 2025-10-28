@@ -713,83 +713,6 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
 }
 
 #[tauri::command]
-async fn test_glob_pattern(pattern: String) -> Result<String, String> {
-    let regex_pattern = glob_to_regex(&pattern);
-    match Regex::new(&regex_pattern) {
-        Ok(regex) => {
-            let test_files = vec![
-                "Test.java",
-                "Main.java", 
-                "Helper.py",
-                "script.js",
-                "config.json",
-                "app.java"
-            ];
-            
-            let matches: Vec<String> = test_files.into_iter()
-                .filter(|filename| regex.is_match(filename))
-                .map(|s| s.to_string())
-                .collect();
-                
-            Ok(format!("Pattern: {}\nRegex: {}\nMatches: {:?}", pattern, regex_pattern, matches))
-        },
-        Err(e) => Err(format!("Invalid regex: {}", e))
-    }
-}
-
-#[tauri::command]
-async fn debug_search(query: String, state: State<'_, AppState>) -> Result<String, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    
-    // Get total count
-    let mut stmt = db.prepare("SELECT COUNT(*) FROM files").map_err(|e| e.to_string())?;
-    let total_files: i64 = stmt.query_row([], |row| row.get(0)).map_err(|e| e.to_string())?;
-    
-    // Get file extension statistics
-    let mut stmt = db.prepare("SELECT SUBSTR(name, INSTR(name, '.') + 1) as ext, COUNT(*) as count FROM files WHERE name LIKE '%.%' GROUP BY ext ORDER BY count DESC LIMIT 20").map_err(|e| e.to_string())?;
-    let extensions: Vec<String> = stmt.query_map([], |row| {
-        let ext: String = row.get(0)?;
-        let count: i64 = row.get(1)?;
-        Ok(format!(".{}: {}", ext, count))
-    })
-    .map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
-    
-    // Search for files containing the query
-    let mut stmt = db.prepare("SELECT name, path FROM files WHERE name LIKE ?1 OR path LIKE ?1 LIMIT 10").map_err(|e| e.to_string())?;
-    let like_query = format!("%{}%", query);
-    
-    let results: Vec<String> = stmt.query_map([&like_query], |row| {
-        let name: String = row.get(0)?;
-        let path: String = row.get(1)?;
-        Ok(format!("{} -> {}", name, path))
-    })
-    .map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
-    
-    // Get some sample file names to see what we have
-    let mut stmt = db.prepare("SELECT name FROM files WHERE name LIKE '%.%' ORDER BY RANDOM() LIMIT 10").map_err(|e| e.to_string())?;
-    let samples: Vec<String> = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        Ok(name)
-    })
-    .map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
-    
-    Ok(format!("Total files: {}\nTop extensions:\n{}\n\nMatching '{}': {}\n{}\n\nSample files:\n{}", 
-        total_files, 
-        extensions.join("\n"),
-        query, 
-        results.len(),
-        results.join("\n"),
-        samples.join("\n")
-    ))
-}
-
-#[tauri::command]
 async fn get_recent_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
@@ -969,9 +892,7 @@ pub fn run() {
             open_file,
             open_file_with,
             get_file_info,
-            get_index_status,
-            debug_search,
-            test_glob_pattern
+            get_index_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -153,64 +153,124 @@ async fn index_directory(path: &Path) {
 }
 
 fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String]) -> Vec<(i64, FileEntry)> {
+    // New smarter search:
+    // - Tokenize the query by whitespace
+    // - Prefer ordered substring matches in filename first, then in the joined path components
+    // - Give a strong boost for contiguous (exact substring) matches
+    // - Fall back to fuzzy matching only when ordered substring checks fail, and require a reasonable score threshold
     let matcher = SkimMatcherV2::default();
-    let mut results: Vec<(i64, FileEntry)> = Vec::with_capacity(100); // Pre-allocate for better performance
-    
+    let mut results: Vec<(i64, FileEntry)> = Vec::with_capacity(100);
+
+    let query_trimmed = query.trim();
+    if query_trimmed.is_empty() {
+        return results;
+    }
+
+    let tokens: Vec<String> = query_trimmed
+        .split_whitespace()
+        .map(|s| s.to_lowercase())
+        .collect();
+
     for (path, name) in files {
-        // Try matching against filename first (most common case)
-        if let Some(name_score) = matcher.fuzzy_match(&name, query) {
-            let boosted_score = if recent.contains(&path) { name_score * 2 } else { name_score };
-            results.push((
-                boosted_score,
-                FileEntry {
-                    path: path.clone(),
-                    name,
-                    last_accessed: None,
-                    access_count: 0,
-                },
-            ));
-            continue; // Skip other checks if filename matches
+        let name_l = name.to_lowercase();
+        let path_l = path.to_lowercase();
+
+        // Check if file is in a library/build directory (should be deprioritized)
+        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
+                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
+                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
+                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
+                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
+                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
+                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
+                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
+                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
+                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
+                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
+                               path_l.contains("/out/") || path_l.contains("\\out\\");
+
+        // Helper: check if all tokens appear in order in a haystack string
+        let in_order_in = |haystack: &str| -> Option<i64> {
+            let mut pos: usize = 0;
+            let mut score_bonus: i64 = 0;
+            for tok in &tokens {
+                if let Some(found) = haystack[pos..].find(tok) {
+                    // found is relative to haystack[pos..]
+                    let abs = pos + found;
+                    // Closer to start => slightly higher score
+                    score_bonus += (1000i64.saturating_sub(abs as i64)).max(0);
+                    pos = abs + tok.len();
+                } else {
+                    return None;
+                }
+            }
+            Some(score_bonus)
+        };
+
+        // 1) Filename ordered substring
+        if let Some(bonus) = in_order_in(&name_l) {
+            // Contiguous match bonus if the whole query appears as substring
+            let contiguous = name_l.contains(query_trimmed);
+            let mut score: i64 = 3000 + bonus;
+            if contiguous {
+                score += 1200;
+            }
+            // Deprioritize library/build directories
+            if is_in_library_dir {
+                score = score / 4; // Significantly reduce score for library files
+            }
+            if recent.contains(&path) { score *= 2; }
+            results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+            continue; // filename match is best, skip further checks
         }
-        
-        // Only check path components if filename didn't match
-        let path_components: Vec<&str> = path.split(['/', '\\'])
-            .filter(|s| !s.is_empty())
-            .collect();
-        
-        if let Some(path_score) = path_components.iter()
-            .filter_map(|component| matcher.fuzzy_match(component, query))
-            .max() 
-        {
-            let boosted_score = if recent.contains(&path) { path_score * 2 } else { path_score };
-            results.push((
-                boosted_score,
-                FileEntry {
-                    path: path.clone(),
-                    name,
-                    last_accessed: None,
-                    access_count: 0,
-                },
-            ));
+
+        // 2) Path components ordered substring (folder names)
+        let components_joined = path_l.split(['/', '\\']).filter(|s| !s.is_empty()).collect::<Vec<&str>>().join("/");
+        if let Some(bonus) = in_order_in(&components_joined) {
+            let contiguous = components_joined.contains(&query_trimmed.to_lowercase());
+            let mut score: i64 = 2000 + bonus;
+            if contiguous { score += 800; }
+            // Deprioritize library/build directories
+            if is_in_library_dir {
+                score = score / 4; // Significantly reduce score for library files
+            }
+            if recent.contains(&path) { score *= 2; }
+            results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
             continue;
         }
-        
-        // Last resort: check full path
-        if let Some(full_path_score) = matcher.fuzzy_match(&path, query) {
-            let boosted_score = if recent.contains(&path) { full_path_score * 2 } else { full_path_score };
-            results.push((
-                boosted_score / 2, // Lower priority for full path matches
-                FileEntry {
-                    path: path.clone(),
-                    name,
-                    last_accessed: None,
-                    access_count: 0,
-                },
-            ));
+
+        // 3) Weak fuzzy fallback (lower priority): require a reasonable fuzzy score to avoid overly loose matches
+        if let Some(fuzzy_score) = matcher.fuzzy_match(&name, query_trimmed) {
+            // require threshold to prevent everything matching; scale down for file-name fuzzy
+            if fuzzy_score >= 60 {
+                let mut score = (fuzzy_score as i64) + 500; // base bump
+                // Deprioritize library/build directories
+                if is_in_library_dir {
+                    score = score / 4; // Significantly reduce score for library files
+                }
+                if recent.contains(&path) { score *= 2; }
+                results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                continue;
+            }
+        }
+
+        // 4) Very last: fuzzy match against full path but with higher bar and lower weight
+        if let Some(full_score) = matcher.fuzzy_match(&path, query_trimmed) {
+            if full_score >= 80 {
+                let mut score = (full_score as i64) / 2; // de-prioritize full-path fuzzy
+                // Deprioritize library/build directories
+                if is_in_library_dir {
+                    score = score / 4; // Significantly reduce score for library files
+                }
+                if recent.contains(&path) { score *= 2; }
+                results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+            }
         }
     }
-    
+
     results
 }
+
 
 // Convert glob pattern to regex pattern
 fn glob_to_regex(glob: &str) -> String {
@@ -266,16 +326,31 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
             || query.starts_with('/') && query.ends_with('/');
         
         let files: Vec<(String, String)> = if needs_all_files {
-            // For pattern searches, get more files but still limit for performance
-            let mut stmt = db
-                .prepare("SELECT path, name FROM files ORDER BY name LIMIT 5000")
-                .map_err(|e| e.to_string())?;
-            
-            let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-            results
+            // For pattern searches, try to optimize with database queries when possible
+            if query.starts_with("*.") && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) {
+                // Simple extension glob like "*.java" - use database LIKE query
+                let extension = &query[2..]; // Remove "*."
+                let mut stmt = db
+                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 10000")
+                    .map_err(|e| e.to_string())?;
+                let like_pattern = format!("%.{}", extension);
+                let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                println!("Extension query '{}' found {} files", like_pattern, results.len());
+                results
+            } else {
+                // Complex patterns - get more files but still limit for performance
+                let mut stmt = db
+                    .prepare("SELECT path, name FROM files ORDER BY name LIMIT 20000")
+                    .map_err(|e| e.to_string())?;
+                let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                results
+            }
         } else if query.len() >= 2 {
             // For regular text searches, use LIKE to pre-filter
             let mut stmt = db
@@ -322,12 +397,29 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
     
     let mut results: Vec<(i64, FileEntry)> = if is_glob_pattern {
         // Handle glob pattern search (convert to regex)
-        println!("Detected glob pattern: '{}'", query);
+        println!("Detected glob pattern: '{}', processing {} files", query, files.len());
         let regex_pattern = glob_to_regex(&query);
+        println!("Converted to regex: '{}'", regex_pattern);
         match Regex::new(&regex_pattern) {
             Ok(regex) => {
-                files.into_iter()
+                let mut match_count = 0;
+                let results: Vec<_> = files.into_iter()
                     .filter_map(|(path, name)| {
+                        // Check if file is in a library/build directory
+                        let path_l = path.to_lowercase();
+                        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
+                                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
+                                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
+                                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
+                                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
+                                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
+                                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
+                                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
+                                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
+                                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
+                                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
+                                               path_l.contains("/out/") || path_l.contains("\\out\\");
+
                         // Check regex match against filename, path components, and full path
                         let name_match = regex.is_match(&name);
                         let path_components: Vec<&str> = path.split(['/', '\\'])
@@ -335,16 +427,35 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                             .collect();
                         let path_component_match = path_components.iter().any(|component| regex.is_match(component));
                         let full_path_match = regex.is_match(&path);
+
+                        // Debug: check for java files specifically
+                        if name.to_lowercase().ends_with(".java") {
+                            println!("Found Java file: {} - name_match: {}, path_component_match: {}, full_path_match: {}", 
+                                     name, name_match, path_component_match, full_path_match);
+                        }
                         
                         if name_match || path_component_match || full_path_match {
-                            // Assign scores based on match type (filename gets highest score)
-                            let score = if name_match { 1000 } 
-                                       else if path_component_match { 800 } 
-                                       else { 600 };
+                            match_count += 1;
+                            // Use improved scoring logic similar to the new search function
+                            let mut score = if name_match { 
+                                // Exact filename pattern match gets highest priority
+                                5000 
+                            } else if path_component_match { 
+                                // Folder name pattern match gets good priority
+                                3000 
+                            } else { 
+                                // Full path match gets lower priority
+                                1500 
+                            };
+
+                            // Deprioritize library/build directories
+                            if is_in_library_dir {
+                                score = score / 4; // Significantly reduce score for library files
+                            }
                                        
                             // Boost score if file is in recent files
                             let boosted_score = if recent.contains(&path) {
-                                score * 2
+                                score + 1000  // Additive boost instead of multiplicative to avoid overflow
                             } else {
                                 score
                             };
@@ -362,10 +473,12 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                             None
                         }
                     })
-                    .collect()
+                    .collect();
+                println!("Glob pattern '{}' matched {} files", query, match_count);
+                results
             },
             Err(_) => {
-                // If glob-to-regex conversion fails, fall back to fuzzy search
+                // If glob-to-regex conversion fails, fall back to new search
                 fuzzy_search_files(files, &query, &recent)
             }
         }
@@ -382,6 +495,21 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
             Ok(regex) => {
                 files.into_iter()
                     .filter_map(|(path, name)| {
+                        // Check if file is in a library/build directory
+                        let path_l = path.to_lowercase();
+                        let is_in_library_dir = path_l.contains("/.git/") || path_l.contains("\\.git\\") ||
+                                               path_l.contains("/node_modules/") || path_l.contains("\\node_modules\\") ||
+                                               path_l.contains("/.vscode/") || path_l.contains("\\.vscode\\") ||
+                                               path_l.contains("/target/") || path_l.contains("\\target\\") ||
+                                               path_l.contains("/build/") || path_l.contains("\\build\\") ||
+                                               path_l.contains("/dist/") || path_l.contains("\\dist\\") ||
+                                               path_l.contains("/__pycache__/") || path_l.contains("\\__pycache__\\") ||
+                                               path_l.contains("/site-packages/") || path_l.contains("\\site-packages\\") ||
+                                               path_l.contains("/vendor/") || path_l.contains("\\vendor\\") ||
+                                               path_l.contains("/.next/") || path_l.contains("\\.next\\") ||
+                                               path_l.contains("/coverage/") || path_l.contains("\\coverage\\") ||
+                                               path_l.contains("/out/") || path_l.contains("\\out\\");
+
                         // Check regex match against filename, path components, and full path
                         let name_match = regex.is_match(&name);
                         let path_components: Vec<&str> = path.split(['/', '\\'])
@@ -391,14 +519,26 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                         let full_path_match = regex.is_match(&path);
                         
                         if name_match || path_component_match || full_path_match {
-                            // Assign scores based on match type (filename gets highest score)
-                            let score = if name_match { 1000 } 
-                                       else if path_component_match { 800 } 
-                                       else { 600 };
+                            // Use improved scoring logic consistent with new search function
+                            let mut score = if name_match { 
+                                // Exact filename regex match gets highest priority
+                                5000 
+                            } else if path_component_match { 
+                                // Folder name regex match gets good priority
+                                3000 
+                            } else { 
+                                // Full path regex match gets lower priority
+                                1500 
+                            };
+
+                            // Deprioritize library/build directories
+                            if is_in_library_dir {
+                                score = score / 4; // Significantly reduce score for library files
+                            }
                                        
                             // Boost score if file is in recent files
                             let boosted_score = if recent.contains(&path) {
-                                score * 2
+                                score + 1000  // Additive boost instead of multiplicative
                             } else {
                                 score
                             };
@@ -419,12 +559,12 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
                     .collect()
             },
             Err(_) => {
-                // If regex is invalid, fall back to fuzzy search
+                // If regex is invalid, fall back to new search
                 fuzzy_search_files(files, &query, &recent)
             }
         }
     } else {
-        // Handle fuzzy search
+        // Handle improved search
         fuzzy_search_files(files, &query, &recent)
     };
 
@@ -433,6 +573,83 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
 
     // Return top 30 results for faster response
     Ok(results.into_iter().take(30).map(|(_, entry)| entry).collect())
+}
+
+#[tauri::command]
+async fn test_glob_pattern(pattern: String) -> Result<String, String> {
+    let regex_pattern = glob_to_regex(&pattern);
+    match Regex::new(&regex_pattern) {
+        Ok(regex) => {
+            let test_files = vec![
+                "Test.java",
+                "Main.java", 
+                "Helper.py",
+                "script.js",
+                "config.json",
+                "app.java"
+            ];
+            
+            let matches: Vec<String> = test_files.into_iter()
+                .filter(|filename| regex.is_match(filename))
+                .map(|s| s.to_string())
+                .collect();
+                
+            Ok(format!("Pattern: {}\nRegex: {}\nMatches: {:?}", pattern, regex_pattern, matches))
+        },
+        Err(e) => Err(format!("Invalid regex: {}", e))
+    }
+}
+
+#[tauri::command]
+async fn debug_search(query: String, state: State<'_, AppState>) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    // Get total count
+    let mut stmt = db.prepare("SELECT COUNT(*) FROM files").map_err(|e| e.to_string())?;
+    let total_files: i64 = stmt.query_row([], |row| row.get(0)).map_err(|e| e.to_string())?;
+    
+    // Get file extension statistics
+    let mut stmt = db.prepare("SELECT SUBSTR(name, INSTR(name, '.') + 1) as ext, COUNT(*) as count FROM files WHERE name LIKE '%.%' GROUP BY ext ORDER BY count DESC LIMIT 20").map_err(|e| e.to_string())?;
+    let extensions: Vec<String> = stmt.query_map([], |row| {
+        let ext: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok(format!(".{}: {}", ext, count))
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+    
+    // Search for files containing the query
+    let mut stmt = db.prepare("SELECT name, path FROM files WHERE name LIKE ?1 OR path LIKE ?1 LIMIT 10").map_err(|e| e.to_string())?;
+    let like_query = format!("%{}%", query);
+    
+    let results: Vec<String> = stmt.query_map([&like_query], |row| {
+        let name: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        Ok(format!("{} -> {}", name, path))
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+    
+    // Get some sample file names to see what we have
+    let mut stmt = db.prepare("SELECT name FROM files WHERE name LIKE '%.%' ORDER BY RANDOM() LIMIT 10").map_err(|e| e.to_string())?;
+    let samples: Vec<String> = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        Ok(name)
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+    
+    Ok(format!("Total files: {}\nTop extensions:\n{}\n\nMatching '{}': {}\n{}\n\nSample files:\n{}", 
+        total_files, 
+        extensions.join("\n"),
+        query, 
+        results.len(),
+        results.join("\n"),
+        samples.join("\n")
+    ))
 }
 
 #[tauri::command]
@@ -529,7 +746,9 @@ pub fn run() {
             search_files,
             get_recent_files,
             open_file,
-            get_index_status
+            get_index_status,
+            debug_search,
+            test_glob_pattern
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

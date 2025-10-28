@@ -19,11 +19,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   recentList = document.querySelector("#recent-list");
   indexStatusEl = document.querySelector("#index-status");
   indexBtn = document.querySelector("#index-btn");
+  const debugBtn = document.querySelector("#debug-btn");
 
   // Setup event listeners
   searchInput.addEventListener("input", handleSearch);
   searchInput.addEventListener("keydown", handleKeyboard);
   indexBtn.addEventListener("click", startIndexing);
+  debugBtn.addEventListener("click", debugJavaFiles);
+  
+  const testGlobBtn = document.querySelector("#test-glob-btn");
+  testGlobBtn.addEventListener("click", testGlobPattern);
   
   // Setup tab listeners
   document.querySelectorAll(".tab-btn").forEach(btn => {
@@ -39,8 +44,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Load recent files in the recent tab
   await loadRecentFiles();
 
-  // Auto-refresh status every 5 seconds during indexing
-  setInterval(updateStatus, 5000);
+  // Auto-refresh status (less frequent to avoid development interruptions)
+  setInterval(updateStatus, 15000);
 });
 
 // Switch between tabs
@@ -371,6 +376,91 @@ function showSuccess(message) {
   // You can implement a toast notification here
   console.log(message);
   alert(message);
+}
+
+// Test glob pattern
+async function testGlobPattern() {
+  try {
+    const result = await invoke("test_glob_pattern", { pattern: "*.java" });
+    
+    // Show results in a popup
+    const debugDiv = document.createElement('div');
+    debugDiv.style.cssText = `
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      bottom: 20px;
+      background: var(--bg-secondary);
+      border: 2px solid var(--accent);
+      border-radius: 10px;
+      padding: 20px;
+      color: var(--text-primary);
+      font-family: monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow-y: auto;
+      z-index: 1000;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    `;
+    
+    debugDiv.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <h3 style="margin: 0; color: var(--accent);">Glob Pattern Test</h3>
+        <button onclick="this.parentElement.parentElement.remove()" style="background: var(--accent); color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer;">Close</button>
+      </div>
+      <div>${result.replace(/\n/g, '<br>')}</div>
+    `;
+    
+    document.body.appendChild(debugDiv);
+    
+  } catch (error) {
+    console.error("Test failed:", error);
+    alert("Test failed: " + error);
+  }
+}
+
+// Debug Java files
+async function debugJavaFiles() {
+  try {
+    // Get general info about indexed files (empty query gets extensions and samples)
+    const result = await invoke("debug_search", { query: "" });
+    
+    // Show results in the search results area
+    const debugDiv = document.createElement('div');
+    debugDiv.style.cssText = `
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      bottom: 20px;
+      background: var(--bg-secondary);
+      border: 2px solid var(--accent);
+      border-radius: 10px;
+      padding: 20px;
+      color: var(--text-primary);
+      font-family: monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow-y: auto;
+      z-index: 1000;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    `;
+    
+    debugDiv.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+        <h3 style="margin: 0; color: var(--accent);">Debug Results</h3>
+        <button onclick="this.parentElement.parentElement.remove()" style="background: var(--accent); color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer;">Close</button>
+      </div>
+      <div>${result.replace(/\n/g, '<br>')}</div>
+    `;
+    
+    document.body.appendChild(debugDiv);
+    
+  } catch (error) {
+    console.error("Debug failed:", error);
+    alert("Debug failed: " + error);
+  }
 }
 
 // Escape HTML to prevent XSS

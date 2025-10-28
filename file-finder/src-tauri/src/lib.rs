@@ -10,6 +10,8 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 use regex::Regex;
+use rayon::prelude::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchOptions {
@@ -114,6 +116,11 @@ impl AppState {
             "CREATE INDEX IF NOT EXISTS idx_name ON files(name)",
             [],
         )?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_path ON files(path)",
+            [],
+        )?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_recent_access ON recent_files(last_accessed DESC)",
@@ -144,13 +151,23 @@ async fn index_directory(path: &Path) {
         .join("file-finder")
         .join("index.db");
 
-    let conn = match Connection::open(db_path) {
+    let mut conn = match Connection::open(db_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);
             return;
         }
     };
+
+    // Optimize database for bulk inserts
+    if let Err(e) = conn.execute_batch(
+        "PRAGMA synchronous = OFF;
+         PRAGMA journal_mode = MEMORY;
+         PRAGMA cache_size = 10000;
+         PRAGMA temp_store = MEMORY;"
+    ) {
+        eprintln!("Failed to optimize database: {}", e);
+    }
 
     // Clear existing files from database for fresh indexing
     if let Err(e) = conn.execute("DELETE FROM files", []) {
@@ -164,9 +181,13 @@ async fn index_directory(path: &Path) {
         .unwrap()
         .as_secs() as i64;
 
-    let mut count = 0;
-
-    for entry in WalkDir::new(path)
+    println!("Collecting files...");
+    
+    // Use HashSet for in-memory duplicate detection
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    
+    // Collect all entries first (this is I/O bound and relatively fast)
+    let entries: Vec<(String, String)> = WalkDir::new(path)
         .follow_links(false)
         .max_depth(10)
         .into_iter()
@@ -180,26 +201,63 @@ async fn index_directory(path: &Path) {
                 && !file_name.eq("Library")
         })
         .filter_map(|e| e.ok())
-    {
-        // Index both files and directories
-        if let Some(path_str) = entry.path().to_str() {
-            if let Some(name) = entry.file_name().to_str() {
-                let _ = conn.execute(
-                    "INSERT INTO files (path, name, indexed_at) VALUES (?1, ?2, ?3)",
-                    params![path_str, name, now],
-                );
-
-                count += 1;
-
-                // Commit every 1000 items for better performance
-                if count % 1000 == 0 {
-                    println!("Indexed {} items...", count);
+        .filter_map(|entry| {
+            // Index both files and directories
+            if let Some(path_str) = entry.path().to_str() {
+                // Check for duplicates using HashSet (O(1) lookup)
+                if seen_paths.contains(path_str) {
+                    return None; // Skip duplicate
+                }
+                
+                if let Some(name) = entry.file_name().to_str() {
+                    seen_paths.insert(path_str.to_string());
+                    return Some((path_str.to_string(), name.to_string()));
                 }
             }
+            None
+        })
+        .collect();
+
+    let total_count = entries.len();
+    println!("Found {} unique items, inserting into database...", total_count);
+
+    // Start a transaction for bulk insert
+    let tx = match conn.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Failed to start transaction: {}", e);
+            return;
+        }
+    };
+
+    // Use prepared statement for better performance
+    // INSERT OR IGNORE handles any edge case duplicates at DB level (extra safety)
+    let mut stmt = match tx.prepare("INSERT OR IGNORE INTO files (path, name, indexed_at) VALUES (?1, ?2, ?3)") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to prepare statement: {}", e);
+            return;
+        }
+    };
+
+    // Insert all entries
+    for (idx, (path_str, name)) in entries.iter().enumerate() {
+        let _ = stmt.execute(params![path_str, name, now]);
+        
+        if (idx + 1) % 10000 == 0 {
+            println!("Inserted {} / {} items...", idx + 1, total_count);
         }
     }
 
-    println!("Indexing complete! Total files: {}", count);
+    drop(stmt);
+
+    // Commit the transaction
+    if let Err(e) = tx.commit() {
+        eprintln!("Failed to commit transaction: {}", e);
+        return;
+    }
+
+    println!("Indexing complete! Total files: {}", total_count);
 }
 
 // Helper function to normalize strings by removing separators for better matching

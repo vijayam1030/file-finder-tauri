@@ -202,6 +202,14 @@ async fn index_directory(path: &Path) {
     println!("Indexing complete! Total files: {}", count);
 }
 
+// Helper function to normalize strings by removing separators for better matching
+fn normalize_for_matching(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
 fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String], options: &SearchOptions) -> Vec<(i64, FileEntry)> {
     // New smarter search:
     // - Tokenize the query by whitespace
@@ -221,9 +229,13 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
         .map(|s| s.to_lowercase())
         .collect();
 
+    // Normalized query (no separators) for matching "finduname" to "find-uname"
+    let query_normalized = normalize_for_matching(query_trimmed);
+
     for (path, name) in files {
         let name_l = name.to_lowercase();
         let path_l = path.to_lowercase();
+        let name_normalized = normalize_for_matching(&name);
 
         // Check if file is in a library/build directory (should be deprioritized)
         let is_in_library_dir = is_library_file(&path);
@@ -246,7 +258,11 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             Some(score_bonus)
         };
 
-        // 1) Filename ordered substring
+        // 1) Try filename matching - use both token-based AND normalized matching
+        let mut matched_filename = false;
+        let mut best_score: i64 = 0;
+        
+        // 1a) Token-based ordered substring matching
         if let Some(bonus) = in_order_in(&name_l) {
             // Check strict mode
             if options.strict_mode {
@@ -255,23 +271,53 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                 let is_prefix = name_l.starts_with(&query_trimmed.to_lowercase());
                 if !is_exact && !is_prefix {
                     // Skip this match in strict mode if not exact/prefix
-                    continue;
+                    // Don't set matched_filename, allow normalized check to run
+                } else {
+                    // Contiguous match bonus if the whole query appears as substring
+                    let contiguous = name_l.contains(query_trimmed);
+                    let mut score: i64 = 3000 + bonus;
+                    if contiguous {
+                        score += 1200;
+                    }
+                    matched_filename = true;
+                    best_score = score;
                 }
+            } else {
+                // Not in strict mode, accept token match
+                let contiguous = name_l.contains(query_trimmed);
+                let mut score: i64 = 3000 + bonus;
+                if contiguous {
+                    score += 1200;
+                }
+                matched_filename = true;
+                best_score = score;
             }
-            
-            // Contiguous match bonus if the whole query appears as substring
-            let contiguous = name_l.contains(query_trimmed);
-            let mut score: i64 = 3000 + bonus;
-            if contiguous {
-                score += 1200;
+        }
+        
+        // 1b) Normalized filename matching (ignores hyphens, underscores, dots)
+        // This allows "finduname" to match "find-uname.py"
+        if !query_normalized.is_empty() && name_normalized.contains(&query_normalized) {
+            let mut score: i64 = 2800; // High score, but slightly below exact token match
+            // Bonus if it's at the start
+            if name_normalized.starts_with(&query_normalized) {
+                score += 500;
             }
+            // Use this score if it's better or if we didn't match via tokens
+            if !matched_filename || score > best_score {
+                matched_filename = true;
+                best_score = score;
+            }
+        }
+        
+        // If we matched the filename via any method, add it to results
+        if matched_filename {
             // Deprioritize library/build directories
             if is_in_library_dir {
-                score = score / 4; // Significantly reduce score for library files
+                best_score = best_score / 4;
             }
-            if recent.contains(&path) { score *= 2; }
-            results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
-            continue; // filename match is best, skip further checks
+            if recent.contains(&path) { best_score *= 2; }
+            results.push((best_score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+            continue;
         }
 
         // 2) Path components ordered substring (folder names) - skip if filename_only or !search_folders
@@ -604,8 +650,8 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     // Sort by score (descending) and limit early for better performance
     results.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Return top 30 results for faster response
-    Ok(results.into_iter().take(30).map(|(_, entry)| entry).collect())
+    // Return top 100 results for faster response
+    Ok(results.into_iter().take(100).map(|(_, entry)| entry).collect())
 }
 
 #[tauri::command]

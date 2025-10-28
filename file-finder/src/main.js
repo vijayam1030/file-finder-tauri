@@ -141,11 +141,19 @@ function switchTab(tabName) {
   }
 }
 
-// Handle search input
+// Handle search input with debouncing
 function handleSearch() {
   // Auto-switch to search tab when typing
   if (activeTab !== 'search') {
-    switchTab('search');
+    activeTab = 'search';
+    // Update tab buttons
+    document.querySelectorAll(".tab-btn").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.tab === 'search');
+    });
+    // Update tab content
+    document.querySelectorAll(".tab-content").forEach(content => {
+      content.classList.toggle("active", content.id === 'search-results');
+    });
   }
   
   clearTimeout(searchTimeout);

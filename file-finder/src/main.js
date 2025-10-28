@@ -9,6 +9,8 @@ let selectedIndex = 0;
 let currentResults = [];
 let searchTimeout;
 let activeTab = 'search';
+let lastKeyTime = 0;
+let lastKey = null;
 
 // Initialize app
 window.addEventListener("DOMContentLoaded", async () => {
@@ -216,24 +218,61 @@ function renderRecentResults(results) {
 function handleKeyboard(e) {
   if (currentResults.length === 0) return;
 
+  const now = Date.now();
+  const isDoubleG = e.key === 'g' && lastKey === 'g' && (now - lastKeyTime) < 500;
+  
+  // Update last key tracking
+  lastKey = e.key;
+  lastKeyTime = now;
+
   switch (e.key) {
     case "ArrowDown":
+    case "j":
       e.preventDefault();
       selectedIndex = Math.min(selectedIndex + 1, currentResults.length - 1);
-      if (activeTab === 'search') {
-        renderSearchResults(currentResults);
-      } else {
-        renderRecentResults(currentResults);
-      }
+      renderCurrentTab();
       break;
 
     case "ArrowUp":
+    case "k":
       e.preventDefault();
       selectedIndex = Math.max(selectedIndex - 1, 0);
-      if (activeTab === 'search') {
-        renderSearchResults(currentResults);
-      } else {
-        renderRecentResults(currentResults);
+      renderCurrentTab();
+      break;
+
+    case "g":
+      if (isDoubleG) {
+        // gg - Go to first item
+        e.preventDefault();
+        selectedIndex = 0;
+        renderCurrentTab();
+      }
+      break;
+
+    case "G":
+      // G - Go to last item
+      e.preventDefault();
+      selectedIndex = currentResults.length - 1;
+      renderCurrentTab();
+      break;
+
+    case "d":
+      if (e.ctrlKey) {
+        // Ctrl+d - Jump down half page
+        e.preventDefault();
+        const halfPage = Math.floor(10); // Roughly half page of items
+        selectedIndex = Math.min(selectedIndex + halfPage, currentResults.length - 1);
+        renderCurrentTab();
+      }
+      break;
+
+    case "u":
+      if (e.ctrlKey) {
+        // Ctrl+u - Jump up half page
+        e.preventDefault();
+        const halfPage = Math.floor(10);
+        selectedIndex = Math.max(selectedIndex - halfPage, 0);
+        renderCurrentTab();
       }
       break;
 
@@ -252,6 +291,15 @@ function handleKeyboard(e) {
         currentResults = [];
       }
       break;
+  }
+}
+
+// Helper function to render the current active tab
+function renderCurrentTab() {
+  if (activeTab === 'search') {
+    renderSearchResults(currentResults);
+  } else {
+    renderRecentResults(currentResults);
   }
 }
 

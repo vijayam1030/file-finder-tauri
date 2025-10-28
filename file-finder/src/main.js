@@ -44,6 +44,22 @@ window.addEventListener("DOMContentLoaded", async () => {
   
   indexBtn.addEventListener("click", startIndexing);
   
+  // Debug button
+  const debugBtn = document.querySelector("#debug-btn");
+  debugBtn.addEventListener("click", async () => {
+    const query = searchInput.value.trim();
+    if (!query) {
+      alert("Enter a search query first");
+      return;
+    }
+    const results = await invoke("debug_search_scores", { query });
+    console.log("Debug scores for:", query);
+    results.forEach(([name, score, path]) => {
+      console.log(`${score}: ${name} (${path})`);
+    });
+    alert(`Check console for debug scores (${results.length} results)`);
+  });
+  
   // Setup settings panel
   const settingsBtn = document.querySelector("#settings-btn");
   const settingsPanel = document.querySelector("#settings-panel");

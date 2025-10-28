@@ -348,13 +348,27 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             // 1b) Token-based ordered substring matching (stricter but gives higher score)
             // If query has extension, require the full query as a substring (not just tokens in order)
             if query_has_extension {
-                // For queries with extensions (e.g., "lib.rs"), require exact substring match
-                if name_l.contains(&query_trimmed.to_lowercase()) {
-                    let mut score: i64 = 5000; // High score for substring match with extension
-                    // Bonus if at the start
-                    if name_l.starts_with(&query_trimmed.to_lowercase()) {
-                        score += 500;
+                // For queries with extensions (e.g., "lib.rs"), check substring match
+                let query_lower = query_trimmed.to_lowercase();
+                if name_l.contains(&query_lower) {
+                    let mut score: i64 = 3000; // Base score for substring match with extension
+                    
+                    // Much higher score if the query matches the entire filename
+                    if name_l == query_lower {
+                        score = 9500; // Almost as good as exact match
                     }
+                    // Bonus if at the start of filename
+                    else if name_l.starts_with(&query_lower) {
+                        score += 1500;
+                    }
+                    // Bonus if the match is at a word boundary (after a separator)
+                    else if name_l.contains(&format!("/{}", query_lower)) || 
+                            name_l.contains(&format!("\\{}", query_lower)) ||
+                            name_l.contains(&format!("-{}", query_lower)) ||
+                            name_l.contains(&format!("_{}", query_lower)) {
+                        score += 800;
+                    }
+                    
                     if score > best_score {
                         best_score = score;
                     }
@@ -519,7 +533,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 // Simple extension glob like "*.java" - use database LIKE query
                 let extension = &query[2..]; // Remove "*."
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 10000")
+                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 LIMIT 10000")
                     .map_err(|e| e.to_string())?;
                 let like_pattern = format!("%.{}", extension);
                 let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -531,7 +545,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             } else {
                 // Complex patterns - get more files but still limit for performance
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files ORDER BY name LIMIT 20000")
+                    .prepare("SELECT path, name FROM files LIMIT 20000")
                     .map_err(|e| e.to_string())?;
                 let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                     .map_err(|e| e.to_string())?
@@ -556,7 +570,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     let word_lower = word.to_lowercase();
                     combined_query.push_str(&format!("(LOWER(name) LIKE '%{}%' OR LOWER(path) LIKE '%{}%')", word_lower, word_lower));
                 }
-                combined_query.push_str(" ORDER BY name LIMIT 2000");
+                combined_query.push_str(" LIMIT 2000");
                 
                 let mut stmt = db.prepare(&combined_query).map_err(|e| e.to_string())?;
                 let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -565,13 +579,20 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .collect();
                 results
             } else {
-                // Single word query: use simple LIKE with case-insensitive matching
+                // Single word query: prioritize exact filename matches, then substring matches
+                // Use UNION to get exact matches first, then other matches
+                let query_lower = query.to_lowercase();
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files WHERE LOWER(name) LIKE ?1 OR LOWER(path) LIKE ?1 ORDER BY name LIMIT 1000")
+                    .prepare("
+                        SELECT path, name FROM files WHERE LOWER(name) = ?1
+                        UNION ALL
+                        SELECT path, name FROM files WHERE LOWER(name) LIKE ?2 AND LOWER(name) != ?1
+                        LIMIT 1000
+                    ")
                     .map_err(|e| e.to_string())?;
                 
-                let like_query = format!("%{}%", query.to_lowercase());
-                let results: Vec<(String, String)> = stmt.query_map([&like_query], |row| Ok((row.get(0)?, row.get(1)?)))
+                let like_query = format!("%{}%", query_lower);
+                let results: Vec<(String, String)> = stmt.query_map([&query_lower, &like_query], |row| Ok((row.get(0)?, row.get(1)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -580,7 +601,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         } else {
             // For single character queries, just limit heavily
             let mut stmt = db
-                .prepare("SELECT path, name FROM files ORDER BY name LIMIT 500")
+                .prepare("SELECT path, name FROM files LIMIT 500")
                 .map_err(|e| e.to_string())?;
             
             let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -925,6 +946,38 @@ async fn get_index_status(state: State<'_, AppState>) -> Result<IndexStatus, Str
     })
 }
 
+#[tauri::command]
+async fn debug_search_scores(state: State<'_, AppState>, query: String) -> Result<Vec<(String, i64, String)>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    let mut stmt = db.prepare("SELECT path, name FROM files WHERE LOWER(name) LIKE ? LIMIT 20")
+        .map_err(|e| e.to_string())?;
+    
+    let pattern = format!("%{}%", query.to_lowercase());
+    let files: Vec<(String, String)> = stmt
+        .query_map([&pattern], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    
+    let options = SearchOptions {
+        search_folders: false,
+        enable_fuzzy: true,
+        strict_mode: false,
+        filename_only: true,
+    };
+    
+    let results = fuzzy_search_files(files, &query, &[], &options);
+    
+    let debug_output: Vec<(String, i64, String)> = results.iter()
+        .map(|(score, entry)| (entry.name.clone(), *score, entry.path.clone()))
+        .collect();
+    
+    Ok(debug_output)
+}
+
 #[derive(Serialize)]
 struct IndexStatus {
     total_files: i64,
@@ -945,7 +998,8 @@ pub fn run() {
             open_file,
             open_file_with,
             get_file_info,
-            get_index_status
+            get_index_status,
+            debug_search_scores
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

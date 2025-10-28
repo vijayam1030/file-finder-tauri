@@ -84,7 +84,7 @@ function handleSearch() {
   searchTimeout = setTimeout(async () => {
     const query = searchInput.value.trim();
     await performSearch(query);
-  }, 150); // Debounce 150ms
+  }, 50); // Debounce 50ms for faster response
 }
 
 // Perform search
@@ -126,14 +126,14 @@ function renderSearchResults(results) {
       resultsList.innerHTML = `
         <div class="empty-state">
           <h3>No files found</h3>
-          <p>Try a different search term or regex pattern</p>
+          <p>Try a different search term, glob pattern (*.js), or regex pattern</p>
         </div>
       `;
     } else {
       resultsList.innerHTML = `
         <div class="empty-state">
           <h3>Enter a search term</h3>
-          <p>Search for files and folders, supports regex patterns</p>
+          <p>Search for files and folders, supports glob (*.js) and regex patterns</p>
         </div>
       `;
     }

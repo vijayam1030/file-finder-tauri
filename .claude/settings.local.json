@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --version:*)",
+      "Bash(cargo --version:*)",
+      "Bash(npm create tauri-app@latest file-finder -- --yes --package-manager npm --template vanilla)",
+      "Bash(npm install)",
+      "Bash(npm run tauri:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

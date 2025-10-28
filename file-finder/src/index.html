@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>File Finder</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <div class="app">
+      <div class="header">
+        <h1>File Finder</h1>
+        <div class="status">
+          <span id="index-status">Initializing...</span>
+          <button id="index-btn" class="btn-small">Start Indexing</button>
+        </div>
+      </div>
+
+      <div class="search-container">
+        <input
+          type="text"
+          id="search-input"
+          placeholder="Type to search files... (empty for recent files)"
+          autofocus
+        />
+      </div>
+
+      <div class="results-container">
+        <div id="results-list"></div>
+      </div>
+
+      <div class="help-text">
+        <kbd>↑</kbd> <kbd>↓</kbd> to navigate • <kbd>Enter</kbd> to open • <kbd>Esc</kbd> to clear
+      </div>
+    </div>
+  </body>
+</html>

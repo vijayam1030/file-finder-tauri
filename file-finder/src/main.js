@@ -2,16 +2,19 @@ const { invoke } = window.__TAURI__.core;
 
 let searchInput;
 let resultsList;
+let recentList;
 let indexStatusEl;
 let indexBtn;
 let selectedIndex = 0;
 let currentResults = [];
 let searchTimeout;
+let activeTab = 'search';
 
 // Initialize app
 window.addEventListener("DOMContentLoaded", async () => {
   searchInput = document.querySelector("#search-input");
   resultsList = document.querySelector("#results-list");
+  recentList = document.querySelector("#recent-list");
   indexStatusEl = document.querySelector("#index-status");
   indexBtn = document.querySelector("#index-btn");
 
@@ -19,17 +22,62 @@ window.addEventListener("DOMContentLoaded", async () => {
   searchInput.addEventListener("input", handleSearch);
   searchInput.addEventListener("keydown", handleKeyboard);
   indexBtn.addEventListener("click", startIndexing);
+  
+  // Setup tab listeners
+  document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      const tab = e.target.dataset.tab;
+      switchTab(tab);
+    });
+  });
 
-  // Load initial status and recent files
+  // Load initial status
   await updateStatus();
+  
+  // Load recent files in the recent tab
   await loadRecentFiles();
 
   // Auto-refresh status every 5 seconds during indexing
   setInterval(updateStatus, 5000);
 });
 
+// Switch between tabs
+function switchTab(tabName) {
+  // Update active tab
+  activeTab = tabName;
+  
+  // Update tab buttons
+  document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.tab === tabName);
+  });
+  
+  // Update tab content
+  document.querySelectorAll(".tab-content").forEach(content => {
+    content.classList.toggle("active", content.id === `${tabName}-results`);
+  });
+  
+  // Load content for the active tab
+  if (tabName === 'recent') {
+    loadRecentFiles();
+  } else if (tabName === 'search') {
+    // Switch to search tab - if there's a query, perform search
+    const query = searchInput.value.trim();
+    if (query) {
+      performSearch(query);
+    } else {
+      // Clear search results when switching to empty search
+      renderSearchResults([]);
+    }
+  }
+}
+
 // Handle search input
 function handleSearch() {
+  // Auto-switch to search tab when typing
+  if (activeTab !== 'search') {
+    switchTab('search');
+  }
+  
   clearTimeout(searchTimeout);
   searchTimeout = setTimeout(async () => {
     const query = searchInput.value.trim();
@@ -40,43 +88,50 @@ function handleSearch() {
 // Perform search
 async function performSearch(query) {
   try {
-    const results = await invoke("search_files", { query });
-    currentResults = results;
-    selectedIndex = 0;
-    renderResults(results);
+    if (query) {
+      const results = await invoke("search_files", { query });
+      currentResults = results;
+      selectedIndex = 0;
+      renderSearchResults(results);
+    } else {
+      currentResults = [];
+      renderSearchResults([]);
+    }
   } catch (error) {
     console.error("Search error:", error);
     showError("Search failed: " + error);
   }
 }
 
-// Load recent files (when search is empty)
+// Load recent files
 async function loadRecentFiles() {
   try {
     const results = await invoke("get_recent_files");
-    currentResults = results;
-    selectedIndex = 0;
-    renderResults(results, true);
+    if (activeTab === 'recent') {
+      currentResults = results;
+      selectedIndex = 0;
+    }
+    renderRecentResults(results);
   } catch (error) {
     console.error("Failed to load recent files:", error);
   }
 }
 
-// Render results
-function renderResults(results, isRecent = false) {
+// Render search results
+function renderSearchResults(results) {
   if (results.length === 0) {
     if (searchInput.value.trim()) {
       resultsList.innerHTML = `
         <div class="empty-state">
           <h3>No files found</h3>
-          <p>Try a different search term</p>
+          <p>Try a different search term or regex pattern</p>
         </div>
       `;
     } else {
       resultsList.innerHTML = `
         <div class="empty-state">
-          <h3>No recent files</h3>
-          <p>Start opening files to see them here</p>
+          <h3>Enter a search term</h3>
+          <p>Search for files and folders, supports regex patterns</p>
         </div>
       `;
     }
@@ -85,8 +140,49 @@ function renderResults(results, isRecent = false) {
 
   const html = results
     .map((file, index) => {
-      const isSelected = index === selectedIndex;
-      const recentBadge = isRecent && file.access_count > 1
+      const isSelected = index === selectedIndex && activeTab === 'search';
+
+      return `
+        <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
+          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-path">${escapeHtml(file.path)}</div>
+        </div>
+      `;
+    })
+    .join("");
+
+  resultsList.innerHTML = html;
+
+  // Add click listeners
+  resultsList.querySelectorAll(".file-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const path = item.dataset.path;
+      openFile(path);
+    });
+  });
+
+  // Scroll selected item into view
+  if (activeTab === 'search') {
+    scrollToSelected();
+  }
+}
+
+// Render recent files
+function renderRecentResults(results) {
+  if (results.length === 0) {
+    recentList.innerHTML = `
+      <div class="empty-state">
+        <h3>No recent files</h3>
+        <p>Start opening files to see them here</p>
+      </div>
+    `;
+    return;
+  }
+
+  const html = results
+    .map((file, index) => {
+      const isSelected = index === selectedIndex && activeTab === 'recent';
+      const recentBadge = file.access_count > 1
         ? `<span class="recent-badge">Used ${file.access_count}x</span>`
         : '';
 
@@ -100,10 +196,10 @@ function renderResults(results, isRecent = false) {
     })
     .join("");
 
-  resultsList.innerHTML = html;
+  recentList.innerHTML = html;
 
   // Add click listeners
-  document.querySelectorAll(".file-item").forEach((item) => {
+  recentList.querySelectorAll(".file-item").forEach((item) => {
     item.addEventListener("click", () => {
       const path = item.dataset.path;
       openFile(path);
@@ -111,7 +207,9 @@ function renderResults(results, isRecent = false) {
   });
 
   // Scroll selected item into view
-  scrollToSelected();
+  if (activeTab === 'recent') {
+    scrollToSelected();
+  }
 }
 
 // Handle keyboard navigation
@@ -122,13 +220,21 @@ function handleKeyboard(e) {
     case "ArrowDown":
       e.preventDefault();
       selectedIndex = Math.min(selectedIndex + 1, currentResults.length - 1);
-      renderResults(currentResults, !searchInput.value.trim());
+      if (activeTab === 'search') {
+        renderSearchResults(currentResults);
+      } else {
+        renderRecentResults(currentResults);
+      }
       break;
 
     case "ArrowUp":
       e.preventDefault();
       selectedIndex = Math.max(selectedIndex - 1, 0);
-      renderResults(currentResults, !searchInput.value.trim());
+      if (activeTab === 'search') {
+        renderSearchResults(currentResults);
+      } else {
+        renderRecentResults(currentResults);
+      }
       break;
 
     case "Enter":
@@ -141,7 +247,10 @@ function handleKeyboard(e) {
     case "Escape":
       e.preventDefault();
       searchInput.value = "";
-      loadRecentFiles();
+      if (activeTab === 'search') {
+        renderSearchResults([]);
+        currentResults = [];
+      }
       break;
   }
 }
@@ -150,10 +259,8 @@ function handleKeyboard(e) {
 async function openFile(path) {
   try {
     await invoke("open_file", { path });
-    // Reload recent files after opening
-    if (!searchInput.value.trim()) {
-      await loadRecentFiles();
-    }
+    // Always reload recent files after opening a file
+    await loadRecentFiles();
   } catch (error) {
     console.error("Failed to open file:", error);
     showError("Failed to open file: " + error);

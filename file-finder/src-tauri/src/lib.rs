@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
+use regex::Regex;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
@@ -101,6 +102,13 @@ async fn index_directory(path: &Path) {
         }
     };
 
+    // Clear existing files from database for fresh indexing
+    if let Err(e) = conn.execute("DELETE FROM files", []) {
+        eprintln!("Failed to clear existing files: {}", e);
+        return;
+    }
+    println!("Cleared existing index, starting fresh...");
+
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -122,20 +130,20 @@ async fn index_directory(path: &Path) {
                 && !file_name.eq("Library")
         })
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
     {
+        // Index both files and directories
         if let Some(path_str) = entry.path().to_str() {
             if let Some(name) = entry.file_name().to_str() {
                 let _ = conn.execute(
-                    "INSERT OR IGNORE INTO files (path, name, indexed_at) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO files (path, name, indexed_at) VALUES (?1, ?2, ?3)",
                     params![path_str, name, now],
                 );
 
                 count += 1;
 
-                // Commit every 1000 files for better performance
+                // Commit every 1000 items for better performance
                 if count % 1000 == 0 {
-                    println!("Indexed {} files...", count);
+                    println!("Indexed {} items...", count);
                 }
             }
         }
@@ -144,10 +152,58 @@ async fn index_directory(path: &Path) {
     println!("Indexing complete! Total files: {}", count);
 }
 
+fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String]) -> Vec<(i64, FileEntry)> {
+    let matcher = SkimMatcherV2::default();
+    files
+        .into_iter()
+        .filter_map(|(path, name)| {
+            // Try matching against filename first
+            let name_score = matcher.fuzzy_match(&name, query);
+            
+            // Also try matching against path components (folder names)
+            let path_components: Vec<&str> = path.split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            let path_score = path_components.iter()
+                .filter_map(|component| matcher.fuzzy_match(component, query))
+                .max();
+            
+            // Also try matching against the full path
+            let full_path_score = matcher.fuzzy_match(&path, query);
+            
+            // Use the best score from all matching attempts
+            let best_score = [name_score, path_score, full_path_score]
+                .into_iter()
+                .filter_map(|s| s)
+                .max();
+            
+            best_score.map(|score| {
+                // Boost score if file is in recent files
+                let boosted_score = if recent.contains(&path) {
+                    score * 2
+                } else {
+                    score
+                };
+
+                (
+                    boosted_score,
+                    FileEntry {
+                        path: path.clone(),
+                        name,
+                        last_accessed: None,
+                        access_count: 0,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
     if query.trim().is_empty() {
-        return get_recent_files(state).await;
+        return Ok(vec![]);
     }
 
     let (files, recent) = {
@@ -178,31 +234,68 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
         (files, recent)
     }; // Database lock is automatically released here
 
-    // Fuzzy search
-    let matcher = SkimMatcherV2::default();
-    let mut results: Vec<(i64, FileEntry)> = files
-        .into_iter()
-        .filter_map(|(path, name)| {
-            matcher.fuzzy_match(&name, &query).map(|score| {
-                // Boost score if file is in recent files
-                let boosted_score = if recent.contains(&path) {
-                    score * 2
-                } else {
-                    score
-                };
-
-                (
-                    boosted_score,
-                    FileEntry {
-                        path: path.clone(),
-                        name,
-                        last_accessed: None,
-                        access_count: 0,
-                    },
-                )
-            })
-        })
-        .collect();
+    // Check if query looks like a regex pattern (contains regex special characters)
+    let is_regex_query = query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '.', '+', '{', '}', '\\']) 
+        || query.starts_with('/') && query.ends_with('/');
+    
+    let mut results: Vec<(i64, FileEntry)> = if is_regex_query {
+        // Handle regex search
+        let regex_pattern = if query.starts_with('/') && query.ends_with('/') && query.len() > 2 {
+            // Remove surrounding slashes for /pattern/ syntax
+            &query[1..query.len()-1]
+        } else {
+            &query
+        };
+        
+        match Regex::new(regex_pattern) {
+            Ok(regex) => {
+                files.into_iter()
+                    .filter_map(|(path, name)| {
+                        // Check regex match against filename, path components, and full path
+                        let name_match = regex.is_match(&name);
+                        let path_components: Vec<&str> = path.split(['/', '\\'])
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let path_component_match = path_components.iter().any(|component| regex.is_match(component));
+                        let full_path_match = regex.is_match(&path);
+                        
+                        if name_match || path_component_match || full_path_match {
+                            // Assign scores based on match type (filename gets highest score)
+                            let score = if name_match { 1000 } 
+                                       else if path_component_match { 800 } 
+                                       else { 600 };
+                                       
+                            // Boost score if file is in recent files
+                            let boosted_score = if recent.contains(&path) {
+                                score * 2
+                            } else {
+                                score
+                            };
+                            
+                            Some((
+                                boosted_score,
+                                FileEntry {
+                                    path: path.clone(),
+                                    name,
+                                    last_accessed: None,
+                                    access_count: 0,
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            },
+            Err(_) => {
+                // If regex is invalid, fall back to fuzzy search
+                fuzzy_search_files(files, &query, &recent)
+            }
+        }
+    } else {
+        // Handle fuzzy search
+        fuzzy_search_files(files, &query, &recent)
+    };
 
     // Sort by score (descending)
     results.sort_by(|a, b| b.0.cmp(&a.0));

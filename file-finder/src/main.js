@@ -24,6 +24,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Setup event listeners
   searchInput.addEventListener("input", handleSearch);
   searchInput.addEventListener("keydown", handleKeyboard);
+  
+  // Global keyboard listener for vim navigation when not typing in search
+  document.addEventListener("keydown", (e) => {
+    // Only handle global keys when search input is not focused
+    if (document.activeElement !== searchInput) {
+      handleKeyboard(e);
+    }
+  });
+  
   indexBtn.addEventListener("click", startIndexing);
   debugBtn.addEventListener("click", debugJavaFiles);
   
@@ -221,6 +230,18 @@ function renderRecentResults(results) {
 
 // Handle keyboard navigation
 function handleKeyboard(e) {
+  // Don't handle vim keys if user is typing in the search input (except for special keys)
+  const isTypingInSearch = document.activeElement === searchInput;
+  const isNavigationKey = ['ArrowDown', 'ArrowUp', 'Enter', 'Escape'].includes(e.key);
+  const isVimKey = ['j', 'k', 'g', 'G'].includes(e.key);
+  const isCtrlKey = e.ctrlKey && ['d', 'u'].includes(e.key);
+  
+  // Allow navigation keys and Escape even when typing
+  // Only block vim keys when actively typing (not for Ctrl combinations)
+  if (isTypingInSearch && isVimKey && !e.ctrlKey) {
+    return; // Let the user type normally
+  }
+  
   if (currentResults.length === 0) return;
 
   const now = Date.now();

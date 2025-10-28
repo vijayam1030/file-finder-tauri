@@ -27,6 +27,30 @@
           placeholder="Type to search files... (supports glob * ? and regex)"
           autofocus
         />
+        <button id="settings-btn" class="settings-btn" title="Search Settings">⚙️</button>
+      </div>
+
+      <!-- Settings Panel -->
+      <div id="settings-panel" class="settings-panel hidden">
+        <h3>Search Settings</h3>
+        <div class="settings-content">
+          <label class="setting-item">
+            <input type="checkbox" id="search-folders" checked />
+            <span>Search in folder names</span>
+          </label>
+          <label class="setting-item">
+            <input type="checkbox" id="search-fuzzy" checked />
+            <span>Enable fuzzy matching</span>
+          </label>
+          <label class="setting-item">
+            <input type="checkbox" id="search-strict" />
+            <span>Strict mode (exact/prefix only)</span>
+          </label>
+          <label class="setting-item">
+            <input type="checkbox" id="search-filename-only" />
+            <span>Filename only (ignore paths)</span>
+          </label>
+        </div>
       </div>
 
       <div class="tabs-container">

@@ -12,6 +12,14 @@ let activeTab = 'search';
 let lastKeyTime = 0;
 let lastKey = null;
 
+// Search options
+let searchOptions = {
+  search_folders: true,
+  enable_fuzzy: true,
+  strict_mode: false,
+  filename_only: false
+};
+
 // Initialize app
 window.addEventListener("DOMContentLoaded", async () => {
   searchInput = document.querySelector("#search-input");
@@ -38,6 +46,52 @@ window.addEventListener("DOMContentLoaded", async () => {
   
   const testGlobBtn = document.querySelector("#test-glob-btn");
   testGlobBtn.addEventListener("click", testGlobPattern);
+  
+  // Setup settings panel
+  const settingsBtn = document.querySelector("#settings-btn");
+  const settingsPanel = document.querySelector("#settings-panel");
+  
+  console.log("Settings button:", settingsBtn);
+  console.log("Settings panel:", settingsPanel);
+  
+  if (settingsBtn && settingsPanel) {
+    settingsBtn.addEventListener("click", (e) => {
+      console.log("Settings button clicked!");
+      e.stopPropagation();
+      settingsPanel.classList.toggle("hidden");
+      console.log("Panel hidden class:", settingsPanel.classList.contains("hidden"));
+    });
+    
+    // Close settings when clicking outside
+    document.addEventListener("click", (e) => {
+      if (!settingsPanel.contains(e.target) && e.target !== settingsBtn) {
+        settingsPanel.classList.add("hidden");
+      }
+    });
+  } else {
+    console.error("Settings button or panel not found!");
+  }
+  
+  // Setup settings checkboxes
+  document.getElementById("search-folders").addEventListener("change", (e) => {
+    searchOptions.search_folders = e.target.checked;
+    performSearch(searchInput.value.trim());
+  });
+  
+  document.getElementById("search-fuzzy").addEventListener("change", (e) => {
+    searchOptions.enable_fuzzy = e.target.checked;
+    performSearch(searchInput.value.trim());
+  });
+  
+  document.getElementById("search-strict").addEventListener("change", (e) => {
+    searchOptions.strict_mode = e.target.checked;
+    performSearch(searchInput.value.trim());
+  });
+  
+  document.getElementById("search-filename-only").addEventListener("change", (e) => {
+    searchOptions.filename_only = e.target.checked;
+    performSearch(searchInput.value.trim());
+  });
   
   // Setup tab listeners
   document.querySelectorAll(".tab-btn").forEach(btn => {
@@ -105,7 +159,7 @@ function handleSearch() {
 async function performSearch(query) {
   try {
     if (query) {
-      const results = await invoke("search_files", { query });
+      const results = await invoke("search_files", { query, options: searchOptions });
       currentResults = results;
       selectedIndex = 0;
       renderSearchResults(results);

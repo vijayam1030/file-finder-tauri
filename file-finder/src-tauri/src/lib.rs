@@ -11,6 +11,25 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 use regex::Regex;
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchOptions {
+    pub search_folders: bool,
+    pub enable_fuzzy: bool,
+    pub strict_mode: bool,
+    pub filename_only: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            search_folders: true,
+            enable_fuzzy: true,
+            strict_mode: false,
+            filename_only: false,
+        }
+    }
+}
+
 // Helper function to check if a file path is in a library/build directory
 fn is_library_file(path: &str) -> bool {
     let path_l = path.to_lowercase();
@@ -183,7 +202,7 @@ async fn index_directory(path: &Path) {
     println!("Indexing complete! Total files: {}", count);
 }
 
-fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String]) -> Vec<(i64, FileEntry)> {
+fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String], options: &SearchOptions) -> Vec<(i64, FileEntry)> {
     // New smarter search:
     // - Tokenize the query by whitespace
     // - Prefer ordered substring matches in filename first, then in the joined path components
@@ -229,6 +248,17 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
 
         // 1) Filename ordered substring
         if let Some(bonus) = in_order_in(&name_l) {
+            // Check strict mode
+            if options.strict_mode {
+                // In strict mode, only allow exact or prefix matches
+                let is_exact = name_l == query_trimmed.to_lowercase();
+                let is_prefix = name_l.starts_with(&query_trimmed.to_lowercase());
+                if !is_exact && !is_prefix {
+                    // Skip this match in strict mode if not exact/prefix
+                    continue;
+                }
+            }
+            
             // Contiguous match bonus if the whole query appears as substring
             let contiguous = name_l.contains(query_trimmed);
             let mut score: i64 = 3000 + bonus;
@@ -244,26 +274,13 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             continue; // filename match is best, skip further checks
         }
 
-        // 2) Path components ordered substring (folder names)
-        let components_joined = path_l.split(['/', '\\']).filter(|s| !s.is_empty()).collect::<Vec<&str>>().join("/");
-        if let Some(bonus) = in_order_in(&components_joined) {
-            let contiguous = components_joined.contains(&query_trimmed.to_lowercase());
-            let mut score: i64 = 2000 + bonus;
-            if contiguous { score += 800; }
-            // Deprioritize library/build directories
-            if is_in_library_dir {
-                score = score / 4; // Significantly reduce score for library files
-            }
-            if recent.contains(&path) { score *= 2; }
-            results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
-            continue;
-        }
-
-        // 3) Weak fuzzy fallback (lower priority): require a reasonable fuzzy score to avoid overly loose matches
-        if let Some(fuzzy_score) = matcher.fuzzy_match(&name, query_trimmed) {
-            // require threshold to prevent everything matching; scale down for file-name fuzzy
-            if fuzzy_score >= 60 {
-                let mut score = (fuzzy_score as i64) + 500; // base bump
+        // 2) Path components ordered substring (folder names) - skip if filename_only or !search_folders
+        if options.search_folders && !options.filename_only {
+            let components_joined = path_l.split(['/', '\\']).filter(|s| !s.is_empty()).collect::<Vec<&str>>().join("/");
+            if let Some(bonus) = in_order_in(&components_joined) {
+                let contiguous = components_joined.contains(&query_trimmed.to_lowercase());
+                let mut score: i64 = 2000 + bonus;
+                if contiguous { score += 800; }
                 // Deprioritize library/build directories
                 if is_in_library_dir {
                     score = score / 4; // Significantly reduce score for library files
@@ -274,16 +291,35 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             }
         }
 
-        // 4) Very last: fuzzy match against full path but with higher bar and lower weight
-        if let Some(full_score) = matcher.fuzzy_match(&path, query_trimmed) {
-            if full_score >= 80 {
-                let mut score = (full_score as i64) / 2; // de-prioritize full-path fuzzy
-                // Deprioritize library/build directories
-                if is_in_library_dir {
-                    score = score / 4; // Significantly reduce score for library files
+        // 3) Weak fuzzy fallback (lower priority) - only if fuzzy is enabled
+        if options.enable_fuzzy && !options.strict_mode {
+            if let Some(fuzzy_score) = matcher.fuzzy_match(&name, query_trimmed) {
+                // require threshold to prevent everything matching; scale down for file-name fuzzy
+                if fuzzy_score >= 60 {
+                    let mut score = (fuzzy_score as i64) + 500; // base bump
+                    // Deprioritize library/build directories
+                    if is_in_library_dir {
+                        score = score / 4; // Significantly reduce score for library files
+                    }
+                    if recent.contains(&path) { score *= 2; }
+                    results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                    continue;
                 }
-                if recent.contains(&path) { score *= 2; }
-                results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+            }
+
+            // 4) Very last: fuzzy match against full path but with higher bar and lower weight
+            if !options.filename_only {
+                if let Some(full_score) = matcher.fuzzy_match(&path, query_trimmed) {
+                    if full_score >= 80 {
+                        let mut score = (full_score as i64) / 2; // de-prioritize full-path fuzzy
+                        // Deprioritize library/build directories
+                        if is_in_library_dir {
+                            score = score / 4; // Significantly reduce score for library files
+                        }
+                        if recent.contains(&path) { score *= 2; }
+                        results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                    }
+                }
             }
         }
     }
@@ -333,7 +369,8 @@ fn glob_to_regex(glob: &str) -> String {
 }
 
 #[tauri::command]
-async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
+async fn search_files(query: String, options: Option<SearchOptions>, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
+    let search_opts = options.unwrap_or_default();
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
@@ -487,7 +524,7 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
             },
             Err(_) => {
                 // If glob-to-regex conversion fails, fall back to new search
-                fuzzy_search_files(files, &query, &recent)
+                fuzzy_search_files(files, &query, &recent, &search_opts)
             }
         }
     } else if is_regex_query {
@@ -556,12 +593,12 @@ async fn search_files(query: String, state: State<'_, AppState>) -> Result<Vec<F
             },
             Err(_) => {
                 // If regex is invalid, fall back to new search
-                fuzzy_search_files(files, &query, &recent)
+                fuzzy_search_files(files, &query, &recent, &search_opts)
             }
         }
     } else {
         // Handle improved search
-        fuzzy_search_files(files, &query, &recent)
+        fuzzy_search_files(files, &query, &recent, &search_opts)
     };
 
     // Sort by score (descending) and limit early for better performance

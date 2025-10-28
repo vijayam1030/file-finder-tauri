@@ -182,6 +182,14 @@ function handleSearch() {
 async function performSearch(query) {
   try {
     if (query) {
+      // Show searching indicator
+      resultsList.innerHTML = `
+        <div class="searching-indicator">
+          <div class="spinner"></div>
+          <p>Searching...</p>
+        </div>
+      `;
+      
       const results = await invoke("search_files", { query, options: searchOptions });
       currentResults = results;
       selectedIndex = 0;
@@ -193,6 +201,8 @@ async function performSearch(query) {
   } catch (error) {
     console.error("Search error:", error);
     showError("Search failed: " + error);
+    // Clear the searching indicator on error
+    renderSearchResults([]);
   }
 }
 
@@ -511,11 +521,28 @@ async function showOpenWithDialog(path) {
       document.body.removeChild(modal);
     });
     
+    // Add Enter key support for custom program input
+    const customInput = modal.querySelector('#custom-program');
+    customInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        modal.querySelector('#modal-custom-open').click();
+      }
+    });
+    
     modal.querySelector('#modal-custom-open').addEventListener('click', async () => {
       const customProgram = modal.querySelector('#custom-program').value.trim();
       if (customProgram) {
         document.body.removeChild(modal);
         await openFileWith(path, customProgram);
+      } else {
+        // Highlight the input if empty
+        const input = modal.querySelector('#custom-program');
+        input.style.borderColor = '#ff4444';
+        input.placeholder = 'Please enter a program path (e.g., notepad.exe)';
+        input.focus();
+        setTimeout(() => {
+          input.style.borderColor = '';
+        }, 2000);
       }
     });
     

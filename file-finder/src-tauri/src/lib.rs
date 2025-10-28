@@ -320,25 +320,37 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
         let mut matched_filename = false;
         let mut best_score: i64 = 0;
         
-        // 1a) Token-based ordered substring matching
+        // 1a) Normalized filename matching (ignores spaces, hyphens, underscores, dots)
+        // This allows "gre word" to match "grewordlist.txt" and "finduname" to match "find-uname.py"
+        // Check this FIRST because it's more permissive
+        if !query_normalized.is_empty() && name_normalized.contains(&query_normalized) {
+            let mut score: i64 = 2900; // High score for normalized match
+            // Bonus if it's at the start
+            if name_normalized.starts_with(&query_normalized) {
+                score += 500;
+            }
+            matched_filename = true;
+            best_score = score;
+        }
+        
+        // 1b) Token-based ordered substring matching (stricter but gives higher score)
         if let Some(bonus) = in_order_in(&name_l) {
             // Check strict mode
             if options.strict_mode {
                 // In strict mode, only allow exact or prefix matches
                 let is_exact = name_l == query_trimmed.to_lowercase();
                 let is_prefix = name_l.starts_with(&query_trimmed.to_lowercase());
-                if !is_exact && !is_prefix {
-                    // Skip this match in strict mode if not exact/prefix
-                    // Don't set matched_filename, allow normalized check to run
-                } else {
-                    // Contiguous match bonus if the whole query appears as substring
+                if is_exact || is_prefix {
                     let contiguous = name_l.contains(query_trimmed);
                     let mut score: i64 = 3000 + bonus;
                     if contiguous {
                         score += 1200;
                     }
+                    // Use this score if it's better than normalized match
+                    if score > best_score {
+                        best_score = score;
+                    }
                     matched_filename = true;
-                    best_score = score;
                 }
             } else {
                 // Not in strict mode, accept token match
@@ -347,23 +359,11 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                 if contiguous {
                     score += 1200;
                 }
+                // Use this score if it's better than normalized match
+                if score > best_score {
+                    best_score = score;
+                }
                 matched_filename = true;
-                best_score = score;
-            }
-        }
-        
-        // 1b) Normalized filename matching (ignores hyphens, underscores, dots)
-        // This allows "finduname" to match "find-uname.py"
-        if !query_normalized.is_empty() && name_normalized.contains(&query_normalized) {
-            let mut score: i64 = 2800; // High score, but slightly below exact token match
-            // Bonus if it's at the start
-            if name_normalized.starts_with(&query_normalized) {
-                score += 500;
-            }
-            // Use this score if it's better or if we didn't match via tokens
-            if !matched_filename || score > best_score {
-                matched_filename = true;
-                best_score = score;
             }
         }
         
@@ -514,16 +514,40 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             }
         } else if query.len() >= 2 {
             // For regular text searches, use LIKE to pre-filter
-            let mut stmt = db
-                .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY name LIMIT 1000")
-                .map_err(|e| e.to_string())?;
+            // Extract individual words for better pre-filtering
+            let words: Vec<&str> = query.split_whitespace().collect();
             
-            let like_query = format!("%{}%", query);
-            let results: Vec<(String, String)> = stmt.query_map([&like_query], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-            results
+            if words.len() > 1 {
+                // Multi-word query: check if ALL words appear in name/path (in any order)
+                // This handles cases like "gre word list" matching "grewordlist.txt"
+                let mut combined_query = String::from("SELECT path, name FROM files WHERE ");
+                for (i, word) in words.iter().enumerate() {
+                    if i > 0 {
+                        combined_query.push_str(" AND ");
+                    }
+                    combined_query.push_str(&format!("(name LIKE '%{}%' OR path LIKE '%{}%')", word, word));
+                }
+                combined_query.push_str(" ORDER BY name LIMIT 2000");
+                
+                let mut stmt = db.prepare(&combined_query).map_err(|e| e.to_string())?;
+                let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                results
+            } else {
+                // Single word query: use simple LIKE
+                let mut stmt = db
+                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY name LIMIT 1000")
+                    .map_err(|e| e.to_string())?;
+                
+                let like_query = format!("%{}%", query);
+                let results: Vec<(String, String)> = stmt.query_map([&like_query], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                results
+            }
         } else {
             // For single character queries, just limit heavily
             let mut stmt = db

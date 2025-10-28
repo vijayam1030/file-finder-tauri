@@ -320,57 +320,82 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
         let mut matched_filename = false;
         let mut best_score: i64 = 0;
         
-        // 1a) Normalized filename matching (ignores spaces, hyphens, underscores, dots)
-        // This allows "gre word" to match "grewordlist.txt" and "finduname" to match "find-uname.py"
-        // Check this FIRST because it's more permissive
-        if !query_normalized.is_empty() && name_normalized.contains(&query_normalized) {
-            let mut score: i64 = 2900; // High score for normalized match
-            // Bonus if it's at the start
-            if name_normalized.starts_with(&query_normalized) {
-                score += 500;
-            }
+        // Check for exact filename match first (highest priority)
+        let is_exact_match = name_l == query_trimmed.to_lowercase();
+        if is_exact_match {
+            best_score = 10000; // Exact match gets highest score
             matched_filename = true;
-            best_score = score;
         }
         
-        // 1b) Token-based ordered substring matching (stricter but gives higher score)
-        if let Some(bonus) = in_order_in(&name_l) {
-            // Check strict mode
-            if options.strict_mode {
-                // In strict mode, only allow exact or prefix matches
-                let is_exact = name_l == query_trimmed.to_lowercase();
-                let is_prefix = name_l.starts_with(&query_trimmed.to_lowercase());
-                if is_exact || is_prefix {
-                    let contiguous = name_l.contains(query_trimmed);
-                    let mut score: i64 = 3000 + bonus;
-                    if contiguous {
-                        score += 1200;
+        let query_has_extension = query_trimmed.contains('.');
+        
+        // Only continue with other matching strategies if not an exact match
+        if !is_exact_match {
+            // 1a) Normalized filename matching (ignores spaces, hyphens, underscores, dots)
+            // This allows "gre word" to match "grewordlist.txt" and "finduname" to match "find-uname.py"
+            // BUT: If query contains a dot (file extension), skip normalized matching to avoid false matches
+            // (e.g., "lib.rs" normalized to "librs" would match "contextlib.rst" normalized to "contextlibrst")
+            if !query_has_extension && !query_normalized.is_empty() && name_normalized.contains(&query_normalized) {
+                let mut score: i64 = 2900; // High score for normalized match
+                // Bonus if it's at the start
+                if name_normalized.starts_with(&query_normalized) {
+                    score += 500;
+                }
+                matched_filename = true;
+                best_score = score;
+            }
+            
+            // 1b) Token-based ordered substring matching (stricter but gives higher score)
+            // If query has extension, require the full query as a substring (not just tokens in order)
+            if query_has_extension {
+                // For queries with extensions (e.g., "lib.rs"), require exact substring match
+                if name_l.contains(&query_trimmed.to_lowercase()) {
+                    let mut score: i64 = 5000; // High score for substring match with extension
+                    // Bonus if at the start
+                    if name_l.starts_with(&query_trimmed.to_lowercase()) {
+                        score += 500;
                     }
-                    // Use this score if it's better than normalized match
                     if score > best_score {
                         best_score = score;
                     }
                     matched_filename = true;
                 }
-            } else {
-                // Not in strict mode, accept token match
-                let contiguous = name_l.contains(query_trimmed);
-                let mut score: i64 = 3000 + bonus;
-                if contiguous {
-                    score += 1200;
+            } else if let Some(bonus) = in_order_in(&name_l) {
+                // No extension in query, use token-based matching
+                // Check strict mode
+                if options.strict_mode {
+                    // In strict mode, only allow exact or prefix matches
+                    let is_prefix = name_l.starts_with(&query_trimmed.to_lowercase());
+                    if is_prefix {
+                        let contiguous = name_l.contains(query_trimmed);
+                        let mut score: i64 = 3000 + bonus;
+                        if contiguous {
+                            score += 1200;
+                        }
+                        if score > best_score {
+                            best_score = score;
+                        }
+                        matched_filename = true;
+                    }
+                } else {
+                    // Not in strict mode, accept token match
+                    let contiguous = name_l.contains(query_trimmed);
+                    let mut score: i64 = 3000 + bonus;
+                    if contiguous {
+                        score += 1200;
+                    }
+                    if score > best_score {
+                        best_score = score;
+                    }
+                    matched_filename = true;
                 }
-                // Use this score if it's better than normalized match
-                if score > best_score {
-                    best_score = score;
-                }
-                matched_filename = true;
             }
         }
         
         // If we matched the filename via any method, add it to results
         if matched_filename {
-            // Deprioritize library/build directories
-            if is_in_library_dir {
+            // Deprioritize library/build directories (but NOT for exact matches)
+            if is_in_library_dir && !is_exact_match {
                 best_score = best_score / 4;
             }
             if recent.contains(&path) { best_score *= 2; }
@@ -396,7 +421,9 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
         }
 
         // 3) Weak fuzzy fallback (lower priority) - only if fuzzy is enabled
-        if options.enable_fuzzy && !options.strict_mode {
+        // Skip fuzzy matching for queries with file extensions (e.g., "lib.rs")
+        // to avoid false matches like "contextlib.rst"
+        if options.enable_fuzzy && !options.strict_mode && !query_has_extension {
             if let Some(fuzzy_score) = matcher.fuzzy_match(&name, query_trimmed) {
                 // require threshold to prevent everything matching; scale down for file-name fuzzy
                 if fuzzy_score >= 60 {
@@ -520,12 +547,14 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             if words.len() > 1 {
                 // Multi-word query: check if ALL words appear in name/path (in any order)
                 // This handles cases like "gre word list" matching "grewordlist.txt"
+                // Use LOWER() for case-insensitive matching
                 let mut combined_query = String::from("SELECT path, name FROM files WHERE ");
                 for (i, word) in words.iter().enumerate() {
                     if i > 0 {
                         combined_query.push_str(" AND ");
                     }
-                    combined_query.push_str(&format!("(name LIKE '%{}%' OR path LIKE '%{}%')", word, word));
+                    let word_lower = word.to_lowercase();
+                    combined_query.push_str(&format!("(LOWER(name) LIKE '%{}%' OR LOWER(path) LIKE '%{}%')", word_lower, word_lower));
                 }
                 combined_query.push_str(" ORDER BY name LIMIT 2000");
                 
@@ -536,12 +565,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .collect();
                 results
             } else {
-                // Single word query: use simple LIKE
+                // Single word query: use simple LIKE with case-insensitive matching
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY name LIMIT 1000")
+                    .prepare("SELECT path, name FROM files WHERE LOWER(name) LIKE ?1 OR LOWER(path) LIKE ?1 ORDER BY name LIMIT 1000")
                     .map_err(|e| e.to_string())?;
                 
-                let like_query = format!("%{}%", query);
+                let like_query = format!("%{}%", query.to_lowercase());
                 let results: Vec<(String, String)> = stmt.query_map([&like_query], |row| Ok((row.get(0)?, row.get(1)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())

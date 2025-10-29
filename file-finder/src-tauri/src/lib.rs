@@ -160,6 +160,18 @@ impl AppState {
             [],
         )?;
 
+        // Add index for fast prefix searches on filename
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_name_prefix ON files(name)",
+            [],
+        )?;
+
+        // Add index for path searches
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)",
+            [],
+        )?;
+
         // Migrate existing databases - add root_directory column if it doesn't exist
         let has_root_directory: bool = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='root_directory'",
@@ -335,9 +347,15 @@ async fn index_directory(path: &Path, clear_existing: bool) {
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            // Skip hidden directories and common ignore patterns
+            // Skip hidden directories and common ignore patterns, but allow dotfiles
             let file_name = e.file_name().to_string_lossy();
-            !file_name.starts_with('.')
+            let is_dir = e.file_type().is_dir();
+            
+            // Skip hidden directories like .git, .vscode, etc. but allow dotfiles like .dockerignore, .gitignore
+            let should_skip_hidden = file_name.starts_with('.') && is_dir && 
+                !file_name.eq(".") && !file_name.eq("..");
+            
+            !should_skip_hidden
                 && !file_name.eq("node_modules")
                 && !file_name.eq("target")
                 && !file_name.eq("AppData")
@@ -689,12 +707,33 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     let (files, recent, favorites) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
-        // Check if this is a glob or regex pattern that needs all files
-        let needs_all_files = query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+        // Check for simple prefix patterns that can be optimized with pure SQL
+        let is_simple_prefix = query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+            && query.matches('*').count() == 1;
+        
+        // Check if this is a complex glob or regex pattern that needs pattern matching
+        let needs_pattern_matching = query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
             || query.starts_with('/') && query.ends_with('/');
         
-        // SEARCH ALL FILES - no directory filtering
-        let files: Vec<(String, String, Option<i64>)> = if needs_all_files {
+        // SEARCH FILES - use different strategies based on query type
+        let files: Vec<(String, String, Option<i64>)> = if is_simple_prefix {
+            // FAST PATH: Simple prefix like "multimodel*" - pure SQL, no pattern matching needed
+            let prefix = &query[..query.len()-1]; // Remove the trailing *
+            if prefix.len() >= 2 {
+                let mut stmt = db
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 1000")
+                    .map_err(|e| e.to_string())?;
+                let like_pattern = format!("{}%", prefix);
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                println!("FAST PATH: Simple prefix '{}' found {} files in pure SQL", prefix, results.len());
+                results
+            } else {
+                vec![]
+            }
+        } else if needs_pattern_matching {
             // For pattern searches, try to optimize with database queries when possible
             if query.starts_with("*.") && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) {
                 // Simple extension glob like "*.java" - use database LIKE query
@@ -723,39 +762,43 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 println!("Optimized pattern query '{}' found {} files", like_pattern, results.len());
                 results
             } else if query.contains('*') {
-                // Generic patterns like "Event*" - use prefix search
+                // Generic patterns like "multimodel*" - use optimized prefix search
                 let prefix = query.replace("*", "");
-                if !prefix.is_empty() {
+                if !prefix.is_empty() && prefix.len() >= 2 {
+                    // Use database prefix search with optimized LIKE query
                     let mut stmt = db
-                        .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
+                        .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
                         .map_err(|e| e.to_string())?;
-                    let like_pattern = format!("{}%", prefix);
-                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    let name_pattern = format!("{}%", prefix);
+                    let path_pattern = format!("%{}%", prefix);
+                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&name_pattern, &path_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                         .map_err(|e| e.to_string())?
                         .filter_map(|r| r.ok())
                         .collect();
-                    println!("Prefix query '{}' found {} files", like_pattern, results.len());
+                    println!("Optimized prefix query '{}' found {} files", name_pattern, results.len());
                     results
                 } else {
-                    // Fallback for complex patterns - limit to reasonable number
+                    // For very short prefixes or complex patterns, limit heavily
                     let mut stmt = db
-                        .prepare("SELECT path, name, modified_at FROM files LIMIT 50000")
+                        .prepare("SELECT path, name, modified_at FROM files LIMIT 5000")
                         .map_err(|e| e.to_string())?;
                     let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                         .map_err(|e| e.to_string())?
                         .filter_map(|r| r.ok())
                         .collect();
+                    println!("Limited fallback query loaded {} files", results.len());
                     results
                 }
             } else {
-                // Complex patterns - limit to reasonable number
+                // Complex patterns - limit heavily for performance
                 let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files LIMIT 50000")
+                    .prepare("SELECT path, name, modified_at FROM files LIMIT 3000")
                     .map_err(|e| e.to_string())?;
                 let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
+                println!("Complex pattern fallback loaded {} files", results.len());
                 results
             }
         } else if query.len() >= 2 {
@@ -838,13 +881,39 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         (files, recent, favorites)
     }; // Database lock is automatically released here
 
-    // Check if query is a pattern (glob or regex)
-    // Prioritize glob detection - if it has * or ? without regex-only chars, treat as glob
-    let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']);
-    let is_regex_query = !is_glob_pattern && (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+    // Check what type of processing we need
+    let is_simple_prefix = query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+        && query.matches('*').count() == 1;
+    let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) && !is_simple_prefix;
+    let is_regex_query = !is_glob_pattern && !is_simple_prefix && (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
         || (query.starts_with('/') && query.ends_with('/')));
     
-    let mut results: Vec<(i64, FileEntry)> = if is_glob_pattern {
+    let mut results: Vec<(i64, FileEntry)> = if is_simple_prefix {
+        // FAST PATH: Results are already filtered by SQL, just convert to FileEntry with scoring
+        println!("FAST PATH: Converting {} SQL results to FileEntry objects", files.len());
+        files.into_iter()
+            .map(|(path, name, modified_at)| {
+                // Simple scoring for prefix matches
+                let mut score = 4000; // High score for exact prefix match
+                
+                // Boost if file is recent or favorite
+                if recent.contains(&path) {
+                    score += 1000;
+                }
+                if favorites.contains(&path) {
+                    score += 2000;
+                }
+                
+                (score, FileEntry {
+                    path,
+                    name,
+                    last_accessed: None,
+                    access_count: 0,
+                    modified_at,
+                })
+            })
+            .collect()
+    } else if is_glob_pattern {
         // Handle glob pattern search (convert to regex)
         println!("Detected glob pattern: '{}', processing {} files", query, files.len());
         let regex_pattern = glob_to_regex(&query);
@@ -855,6 +924,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let mut match_count = 0;
                 let mut java_file_count = 0;
                 let results: Vec<_> = files.into_iter()
+                    .take(10000) // Limit processing to first 10k files for performance
                     .filter_map(|(path, name, modified_at)| {
                         // Check if file is in a library/build directory
                         let is_in_library_dir = is_library_file(&path);

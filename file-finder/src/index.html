@@ -26,6 +26,68 @@
           autofocus
         />
         <button id="settings-btn" class="settings-btn" title="Search Settings">⚙️</button>
+        <button id="regex-help-btn" class="regex-help-btn" title="Regex Help">?</button>
+      </div>
+
+      <!-- Regex Help Panel -->
+      <div id="regex-help-panel" class="regex-help-panel hidden">
+        <div class="help-header">
+          <h3>Search Patterns & Regex Guide</h3>
+          <button id="close-regex-help" class="close-btn">×</button>
+        </div>
+        <div class="help-content">
+          <div class="help-section">
+            <h4>🔍 Simple Patterns</h4>
+            <div class="examples">
+              <div class="example" data-pattern="config*">
+                <code>config*</code> - Files starting with "config"
+              </div>
+              <div class="example" data-pattern="*.js">
+                <code>*.js</code> - All JavaScript files
+              </div>
+              <div class="example" data-pattern="test*.py">
+                <code>test*.py</code> - Python test files
+              </div>
+            </div>
+          </div>
+
+          <div class="help-section">
+            <h4>⚡ Regex Patterns</h4>
+            <div class="examples">
+              <div class="example" data-pattern="config\.(js|ts|json)$">
+                <code>config\.(js|ts|json)$</code> - Config files (js, ts, or json)
+              </div>
+              <div class="example" data-pattern="/(test|spec)\..*$/">
+                <code>/(test|spec)\..*$/</code> - Test or spec files
+              </div>
+              <div class="example" data-pattern="^[A-Z].*\.java$">
+                <code>^[A-Z].*\.java$</code> - Java files starting with uppercase
+              </div>
+              <div class="example" data-pattern="controller|service|model">
+                <code>controller|service|model</code> - Files containing these terms
+              </div>
+              <div class="example" data-pattern="\d{4}-\d{2}-\d{2}">
+                <code>\d{4}-\d{2}-\d{2}</code> - Files with date patterns (YYYY-MM-DD)
+              </div>
+            </div>
+          </div>
+
+          <div class="help-section">
+            <h4>📚 Common Regex Symbols</h4>
+            <div class="regex-symbols">
+              <div><code>^</code> - Start of string</div>
+              <div><code>$</code> - End of string</div>
+              <div><code>.</code> - Any character</div>
+              <div><code>*</code> - Zero or more</div>
+              <div><code>+</code> - One or more</div>
+              <div><code>?</code> - Zero or one</div>
+              <div><code>|</code> - OR operator</div>
+              <div><code>[a-z]</code> - Character range</div>
+              <div><code>\d</code> - Digit (0-9)</div>
+              <div><code>\w</code> - Word character</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Settings Panel -->

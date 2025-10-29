@@ -700,3 +700,146 @@ kbd {
 .btn-secondary:hover {
   background: var(--bg-hover);
 }
+
+/* Regex Help Panel */
+.regex-help-btn {
+  width: 36px;
+  height: 36px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 50%;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.regex-help-btn:hover {
+  background: var(--accent-hover);
+}
+
+.regex-help-panel {
+  position: absolute;
+  top: 120px;
+  left: 20px;
+  right: 20px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+  z-index: 1000;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.regex-help-panel.hidden {
+  display: none;
+}
+
+.help-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.help-header h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 18px;
+}
+
+.close-btn {
+  width: 32px;
+  height: 32px;
+  background: none;
+  border: none;
+  font-size: 24px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.2s;
+}
+
+.close-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.help-content {
+  padding: 20px 24px;
+}
+
+.help-section {
+  margin-bottom: 24px;
+}
+
+.help-section:last-child {
+  margin-bottom: 0;
+}
+
+.help-section h4 {
+  margin: 0 0 12px 0;
+  color: var(--text-primary);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.examples {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.example {
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Roboto Mono', monospace;
+}
+
+.example:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.example code {
+  background: var(--accent);
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  margin-right: 8px;
+  font-size: 13px;
+}
+
+.regex-symbols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.regex-symbols > div {
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Roboto Mono', monospace;
+  font-size: 13px;
+}
+
+.regex-symbols code {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 8px;
+}

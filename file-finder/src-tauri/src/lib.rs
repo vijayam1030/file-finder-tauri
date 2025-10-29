@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{SystemTime, Instant};
 use tauri::State;
 use walkdir::WalkDir;
 use fuzzy_matcher::FuzzyMatcher;
@@ -77,6 +77,17 @@ pub struct FileEntry {
 
 pub struct AppState {
     db: Mutex<Connection>,
+}
+
+// Fuzzy matching helper function
+fn fuzzy_match_score(text: &str, pattern: &str) -> f32 {
+    let matcher = SkimMatcherV2::default();
+    if let Some(score) = matcher.fuzzy_match(text, pattern) {
+        // Normalize score to 0.0-1.0 range
+        (score as f32 / 100.0).min(1.0).max(0.0)
+    } else {
+        0.0
+    }
 }
 
 impl AppState {
@@ -708,30 +719,107 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
         // Check for simple prefix patterns that can be optimized with pure SQL
-        let is_simple_prefix = query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-            && query.matches('*').count() == 1;
+        let is_simple_prefix = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+            && query.matches('*').count() == 1) ||
+            // Also detect regex patterns that are actually simple prefixes like "^multi.*" (but not "^multi.*java")
+            (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
+             !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
+
+        // Check for optimizable prefix + suffix patterns like "^multi.*java"
+        let is_prefix_suffix_pattern = query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
+            !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']);
+        
+        // Additional debugging for prefix+suffix pattern detection
+        if query.starts_with('^') && query.contains(".*") {
+            println!("PREFIX+SUFFIX DEBUG: query='{}', starts_with_^=true, contains_.*=true, ends_with_.*={}, contains_exclusions={}", 
+                     query, query.ends_with(".*"), query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']));
+        }
+        
+        // Debug logging to trace path selection
+        println!("SEARCH DEBUG: query='{}', ends_with_*={}, star_count={}, is_simple_prefix={}", 
+                 query, query.ends_with('*'), query.matches('*').count(), is_simple_prefix);
+        println!("PATTERN DEBUG: is_prefix_suffix_pattern={}, starts_with_^={}, contains_.*={}, ends_with_.*={}", 
+                 is_prefix_suffix_pattern, query.starts_with('^'), query.contains(".*"), query.ends_with(".*"));
         
         // Check if this is a complex glob or regex pattern that needs pattern matching
-        let needs_pattern_matching = query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-            || query.starts_with('/') && query.ends_with('/');
+        let needs_pattern_matching = !is_simple_prefix && !is_prefix_suffix_pattern && 
+            (query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+            || query.starts_with('/') && query.ends_with('/'));
         
         // SEARCH FILES - use different strategies based on query type
         let files: Vec<(String, String, Option<i64>)> = if is_simple_prefix {
-            // FAST PATH: Simple prefix like "multimodel*" - pure SQL, no pattern matching needed
-            let prefix = &query[..query.len()-1]; // Remove the trailing *
+            // FAST PATH: Simple prefix patterns - pure SQL, no pattern matching needed
+            let prefix = if query.starts_with('^') && query.ends_with(".*") {
+                // Handle "^multi.*" format - extract "multi"
+                &query[1..query.len()-2]
+            } else if query.ends_with('*') {
+                // Handle "multi*" format - extract "multi"
+                &query[..query.len()-1]
+            } else {
+                ""
+            };
+            
             if prefix.len() >= 2 {
+                let start_time = std::time::Instant::now();
                 let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 1000")
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 500")
                     .map_err(|e| e.to_string())?;
                 let like_pattern = format!("{}%", prefix);
                 let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
-                println!("FAST PATH: Simple prefix '{}' found {} files in pure SQL", prefix, results.len());
+                let duration = start_time.elapsed();
+                println!("FAST PATH: Simple prefix '{}' (from query '{}') found {} files in {}ms", prefix, query, results.len(), duration.as_millis());
                 results
             } else {
                 vec![]
+            }
+        } else if is_prefix_suffix_pattern {
+            // OPTIMIZED PATH: Patterns like "^multi.*java" - use SQL prefix filtering + regex matching
+            println!("ENTERING PREFIX+SUFFIX PATH for query: '{}'", query);
+            let parts: Vec<&str> = query[1..].split(".*").collect(); // Remove ^ and split on .*
+            println!("SPLIT DEBUG: parts={:?}", parts);
+            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                let prefix = parts[0];
+                let suffix = parts[1];
+                println!("OPTIMIZED PATH: Prefix+suffix pattern - prefix='{}', suffix='{}'", prefix, suffix);
+                
+                let start_time = Instant::now();
+                // Use SQL to pre-filter by prefix, then apply regex for full validation
+                let mut stmt = db
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
+                    .map_err(|e| e.to_string())?;
+                let like_pattern = format!("{}%", prefix);
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let duration = start_time.elapsed();
+                println!("OPTIMIZED PATH: Pre-filtered {} files with prefix '{}' in {}ms", results.len(), prefix, duration.as_millis());
+                
+                // Debug: show first few pre-filtered files
+                if results.len() > 0 {
+                    println!("SAMPLE PRE-FILTERED FILES:");
+                    for (i, (path, name, _)) in results.iter().take(5).enumerate() {
+                        println!("  {}. {} ({})", i + 1, name, path);
+                    }
+                } else {
+                    println!("WARNING: No files found with prefix '{}'", prefix);
+                }
+                
+                results
+            } else {
+                // Fallback to loading more files for complex patterns
+                let mut stmt = db
+                    .prepare("SELECT path, name, modified_at FROM files LIMIT 15000")
+                    .map_err(|e| e.to_string())?;
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                println!("OPTIMIZED PATH: Loaded {} files for complex prefix+suffix pattern", results.len());
+                results
             }
         } else if needs_pattern_matching {
             // For pattern searches, try to optimize with database queries when possible
@@ -778,9 +866,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     println!("Optimized prefix query '{}' found {} files", name_pattern, results.len());
                     results
                 } else {
-                    // For very short prefixes or complex patterns, limit heavily
+                    // For very short prefixes or complex patterns, load more files
                     let mut stmt = db
-                        .prepare("SELECT path, name, modified_at FROM files LIMIT 5000")
+                        .prepare("SELECT path, name, modified_at FROM files LIMIT 10000")
                         .map_err(|e| e.to_string())?;
                     let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                         .map_err(|e| e.to_string())?
@@ -790,9 +878,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     results
                 }
             } else {
-                // Complex patterns - limit heavily for performance
+                // Complex patterns - load more files for better coverage
                 let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files LIMIT 3000")
+                    .prepare("SELECT path, name, modified_at FROM files LIMIT 8000")
                     .map_err(|e| e.to_string())?;
                 let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
@@ -881,20 +969,35 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         (files, recent, favorites)
     }; // Database lock is automatically released here
 
-    // Check what type of processing we need
-    let is_simple_prefix = query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-        && query.matches('*').count() == 1;
-    let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) && !is_simple_prefix;
-    let is_regex_query = !is_glob_pattern && !is_simple_prefix && (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+    // Use the same pattern detection logic as used for file loading
+    let is_simple_prefix_result = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+        && query.matches('*').count() == 1) ||
+        // Also detect regex patterns that are actually simple prefixes like "^multi.*" (but not "^multi.*java")
+        (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
+         !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
+
+    let is_prefix_suffix_result = query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
+        !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']);
+    
+    let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) && 
+        !is_simple_prefix_result && !is_prefix_suffix_result;
+    let is_regex_query = !is_glob_pattern && !is_simple_prefix_result && !is_prefix_suffix_result && 
+        (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
         || (query.starts_with('/') && query.ends_with('/')));
     
-    let mut results: Vec<(i64, FileEntry)> = if is_simple_prefix {
-        // FAST PATH: Results are already filtered by SQL, just convert to FileEntry with scoring
-        println!("FAST PATH: Converting {} SQL results to FileEntry objects", files.len());
-        files.into_iter()
+    println!("PROCESSING DEBUG: is_simple_prefix_result={}, is_prefix_suffix_result={}, is_glob_pattern={}, is_regex_query={}", 
+             is_simple_prefix_result, is_prefix_suffix_result, is_glob_pattern, is_regex_query);
+    
+    let mut results: Vec<(i64, FileEntry)> = if is_simple_prefix_result {
+        // HYBRID APPROACH: Fast exact matches + fuzzy search for better coverage
+        let prefix = &query[..query.len()-1]; // Remove the trailing *
+        
+        // Step 1: Get exact prefix matches (fast SQL)
+        println!("FAST PATH: Converting {} exact matches to FileEntry objects", files.len());
+        let mut exact_results: Vec<(i64, FileEntry)> = files.into_iter()
             .map(|(path, name, modified_at)| {
-                // Simple scoring for prefix matches
-                let mut score = 4000; // High score for exact prefix match
+                // High score for exact prefix matches
+                let mut score = 5000;
                 
                 // Boost if file is recent or favorite
                 if recent.contains(&path) {
@@ -912,7 +1015,121 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     modified_at,
                 })
             })
-            .collect()
+            .collect();
+
+        // Step 2: If we have few exact matches, add fuzzy matches for better coverage
+        if exact_results.len() < 50 && prefix.len() >= 3 {
+            println!("Adding fuzzy search for broader coverage (query: '{}')", prefix);
+            
+            // Get a broader set of files for fuzzy matching - use a new scope to manage the database connection
+            let fuzzy_files: Vec<(String, String, Option<i64>)> = {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                let mut stmt = db
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
+                    .map_err(|e| e.to_string())?;
+                let broad_pattern = format!("%{}%", prefix);
+                let results = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                results
+            }; // Database connection is automatically dropped here
+            
+            // Apply fuzzy matching with lower scores
+            let fuzzy_results: Vec<(i64, FileEntry)> = fuzzy_files.into_iter()
+                .filter_map(|(path, name, modified_at)| {
+                    // Skip if we already have this file from exact matches
+                    if exact_results.iter().any(|(_, entry)| entry.path == path) {
+                        return None;
+                    }
+                    
+                    // Calculate fuzzy match score
+                    let name_score = fuzzy_match_score(&name.to_lowercase(), &prefix.to_lowercase());
+                    let path_score = fuzzy_match_score(&path.to_lowercase(), &prefix.to_lowercase());
+                    let best_score = name_score.max(path_score);
+                    
+                    if best_score > 0.6 { // Only include good fuzzy matches
+                        let mut score = (best_score * 3000.0) as i64; // Lower than exact matches
+                        
+                        // Boost if file is recent or favorite
+                        if recent.contains(&path) {
+                            score += 1000;
+                        }
+                        if favorites.contains(&path) {
+                            score += 2000;
+                        }
+                        
+                        Some((score, FileEntry {
+                            path,
+                            name,
+                            last_accessed: None,
+                            access_count: 0,
+                            modified_at,
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            println!("Added {} fuzzy matches to {} exact matches", fuzzy_results.len(), exact_results.len());
+            exact_results.extend(fuzzy_results);
+        }
+        
+        exact_results
+    } else if is_prefix_suffix_result {
+        // OPTIMIZED PREFIX+SUFFIX: Pre-filtered files, apply regex for exact matching
+        println!("PREFIX+SUFFIX: Processing {} pre-filtered files with regex '{}'", files.len(), query);
+        match Regex::new(&query) {
+            Ok(regex) => {
+                let mut match_count = 0;
+                let results: Vec<_> = files.into_iter()
+                    .filter_map(|(path, name, modified_at)| {
+                        let name_match = regex.is_match(&name);
+                        let path_match = regex.is_match(&path);
+                        
+                        // Debug first few files
+                        if match_count < 5 {
+                            println!("  REGEX TEST: '{}' -> name_match={}, path_match={}", name, name_match, path_match);
+                        }
+                        
+                        if name_match || path_match {
+                            match_count += 1;
+                            if match_count <= 3 {
+                                println!("  MATCH #{}: {} ({})", match_count, name, path);
+                            }
+                            let mut score = if name_match { 4500 } else { 3500 };
+                            
+                            // Boost if file is recent or favorite
+                            if recent.contains(&path) {
+                                score += 1000;
+                            }
+                            if favorites.contains(&path) {
+                                score += 2000;
+                            }
+                            
+                            Some((score, FileEntry {
+                                path,
+                                name,
+                                last_accessed: None,
+                                access_count: 0,
+                                modified_at,
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                
+                println!("PREFIX+SUFFIX RESULT: Found {} matches", match_count);
+                results
+            },
+            Err(_) => {
+                // If regex fails, fallback to fuzzy search
+                let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+                fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
+            }
+        }
     } else if is_glob_pattern {
         // Handle glob pattern search (convert to regex)
         println!("Detected glob pattern: '{}', processing {} files", query, files.len());

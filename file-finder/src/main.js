@@ -185,6 +185,46 @@ window.addEventListener("DOMContentLoaded", async () => {
   } else {
     console.error("Settings button or panel not found!");
   }
+
+  // Setup Regex Help Panel
+  const regexHelpBtn = document.getElementById("regex-help-btn");
+  const regexHelpPanel = document.getElementById("regex-help-panel");
+  const closeRegexHelp = document.getElementById("close-regex-help");
+  
+  if (regexHelpBtn && regexHelpPanel) {
+    regexHelpBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      regexHelpPanel.classList.toggle("hidden");
+      // Close settings panel if open
+      if (settingsPanel) {
+        settingsPanel.classList.add("hidden");
+      }
+    });
+    
+    closeRegexHelp.addEventListener("click", () => {
+      regexHelpPanel.classList.add("hidden");
+    });
+    
+    // Close regex help when clicking outside
+    document.addEventListener("click", (e) => {
+      if (!regexHelpPanel.contains(e.target) && e.target !== regexHelpBtn) {
+        regexHelpPanel.classList.add("hidden");
+      }
+    });
+
+    // Make example patterns clickable
+    document.querySelectorAll(".example").forEach(example => {
+      example.addEventListener("click", () => {
+        const pattern = example.getAttribute("data-pattern");
+        if (pattern) {
+          searchInput.value = pattern;
+          searchInput.focus();
+          regexHelpPanel.classList.add("hidden");
+          performSearch(pattern);
+        }
+      });
+    });
+  }
   
   // Setup settings checkboxes
   document.getElementById("search-folders").addEventListener("change", (e) => {

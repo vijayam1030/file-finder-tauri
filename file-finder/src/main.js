@@ -1214,10 +1214,11 @@ async function debugCheckFile(filePath) {
     }
     
     console.log("=== END DEBUG ===");
-    console.log("💡 Analysis complete. The file likely exists but wasn't indexed due to:")
-    console.log("   - Deep directory nesting (buildSrc/src/main/java/org/springframework/boot/build/)")
-    console.log("   - Possible indexing limits or exclusions")
-    console.log("   - Try re-indexing C:\\charry\\java\\source\\spring-boot\\buildSrc specifically");
+    console.log("💡 Analysis complete. If files are missing:")
+    console.log("   - The 10-level depth limit has been REMOVED from indexing")
+    console.log("   - All files at any depth will now be indexed")
+    console.log("   - Re-index the root directory (C:\\) to pick up previously missed deep files")
+    console.log("   - Or re-index specific folders for faster results");
     
   } catch (error) {
     console.error('❌ Debug check failed:', error);

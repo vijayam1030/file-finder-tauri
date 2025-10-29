@@ -325,7 +325,6 @@ async fn index_directory(path: &Path, clear_existing: bool) {
     // Collect all entries first (this is I/O bound and relatively fast)
     let entries: Vec<(String, String)> = WalkDir::new(path)
         .follow_links(false)
-        .max_depth(10)
         .into_iter()
         .filter_entry(|e| {
             // Skip hidden directories and common ignore patterns

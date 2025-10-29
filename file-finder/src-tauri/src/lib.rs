@@ -10,7 +10,6 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 use regex::Regex;
-use rayon::prelude::*;
 use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -60,7 +59,11 @@ fn is_library_file(path: &str) -> bool {
     // Other common library patterns
     path_l.contains("/program files/") || path_l.contains("\\program files\\") ||
     path_l.contains("/appdata/") || path_l.contains("\\appdata\\") ||
-    path_l.contains("/.cache/") || path_l.contains("\\.cache\\")
+    path_l.contains("/.cache/") || path_l.contains("\\.cache\\") ||
+    // Windows system directories
+    path_l.contains("\\windows\\winsxs\\") || path_l.contains("/windows/winsxs/") ||
+    path_l.contains("\\windows\\system32\\") || path_l.contains("/windows/system32/") ||
+    path_l.contains("\\windows\\syswow64\\") || path_l.contains("/windows/syswow64/")
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -95,7 +98,19 @@ impl AppState {
                 id INTEGER PRIMARY KEY,
                 path TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
+                root_directory TEXT NOT NULL,
                 indexed_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS indexed_directories (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL,
+                is_active INTEGER DEFAULT 0
             )",
             [],
         )?;
@@ -107,6 +122,16 @@ impl AppState {
                 name TEXT NOT NULL,
                 last_accessed INTEGER NOT NULL,
                 access_count INTEGER DEFAULT 1
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS favorite_files (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                favorited_at INTEGER NOT NULL
             )",
             [],
         )?;
@@ -127,6 +152,28 @@ impl AppState {
             [],
         )?;
 
+        // Migrate existing databases - add root_directory column if it doesn't exist
+        let has_root_directory: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='root_directory'",
+            [],
+            |row| row.get::<_, i32>(0).map(|count| count > 0)
+        ).unwrap_or(false);
+
+        if !has_root_directory {
+            println!("Migrating database: adding root_directory column");
+            // Add the column with a default value
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN root_directory TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+            
+            // Set root_directory to empty string for existing files
+            conn.execute(
+                "UPDATE files SET root_directory = '' WHERE root_directory IS NULL OR root_directory = ''",
+                [],
+            )?;
+        }
+
         Ok(AppState {
             db: Mutex::new(conn),
         })
@@ -135,17 +182,44 @@ impl AppState {
 
 #[tauri::command]
 async fn start_indexing(_state: State<'_, AppState>) -> Result<String, String> {
+    println!("start_indexing command called");
     let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    println!("Home directory: {:?}", home_dir);
 
     // Spawn a background task for indexing
     tauri::async_runtime::spawn(async move {
-        index_directory(&home_dir).await;
+        println!("Starting background indexing task...");
+        index_directory(&home_dir, true).await;
+        println!("Background indexing task completed");
     });
 
     Ok("Indexing started in background".to_string())
 }
 
-async fn index_directory(path: &Path) {
+#[tauri::command]
+async fn index_custom_folder(path: String, _state: State<'_, AppState>) -> Result<String, String> {
+    println!("index_custom_folder command called with path: {}", path);
+    let folder_path = PathBuf::from(&path);
+    
+    if !folder_path.exists() {
+        return Err("Folder does not exist".to_string());
+    }
+    
+    if !folder_path.is_dir() {
+        return Err("Path is not a directory".to_string());
+    }
+
+    // Spawn a background task for indexing (don't clear existing files)
+    tauri::async_runtime::spawn(async move {
+        println!("Starting background indexing for custom folder...");
+        index_directory(&folder_path, false).await;
+        println!("Background indexing for custom folder completed");
+    });
+
+    Ok(format!("Indexing folder: {}", path))
+}
+
+async fn index_directory(path: &Path, clear_existing: bool) {
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("file-finder")
@@ -169,22 +243,84 @@ async fn index_directory(path: &Path) {
         eprintln!("Failed to optimize database: {}", e);
     }
 
-    // Clear existing files from database for fresh indexing
-    if let Err(e) = conn.execute("DELETE FROM files", []) {
-        eprintln!("Failed to clear existing files: {}", e);
-        return;
+    // Get or create directory entry
+    let root_dir_str = path.to_string_lossy().to_string();
+    
+    // Check if directory is already indexed
+    let already_indexed: bool = conn.query_row(
+        "SELECT COUNT(*) FROM indexed_directories WHERE path = ?1",
+        [&root_dir_str],
+        |row| row.get::<_, i32>(0).map(|count| count > 0)
+    ).unwrap_or(false);
+    
+    if clear_existing {
+        // Full reindex - clear all files from this directory
+        if let Err(e) = conn.execute("DELETE FROM files WHERE root_directory = ?1", [&root_dir_str]) {
+            eprintln!("Failed to clear existing files for directory: {}", e);
+            return;
+        }
+        println!("Cleared existing index for directory: {}, starting fresh...", root_dir_str);
+    } else if already_indexed {
+        // Incremental update - keep existing files, only add new ones
+        println!("Directory already indexed: {}, will add new files only...", root_dir_str);
+    } else {
+        // First time indexing this directory
+        println!("First time indexing directory: {}", root_dir_str);
     }
-    println!("Cleared existing index, starting fresh...");
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    
+    // Add or update the directory in indexed_directories table
+    let dir_name = if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        name.to_string()
+    } else {
+        // Handle root paths like C:\ or /
+        root_dir_str.clone()
+    };
+    
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO indexed_directories (path, name, indexed_at, is_active) VALUES (?1, ?2, ?3, 1)",
+        params![&root_dir_str, &dir_name, now],
+    ) {
+        eprintln!("Failed to save indexed directory: {}", e);
+    }
+    
+    // Set all other directories as inactive
+    if let Err(e) = conn.execute(
+        "UPDATE indexed_directories SET is_active = 0 WHERE path != ?1",
+        [&root_dir_str],
+    ) {
+        eprintln!("Failed to update directory status: {}", e);
+    }
 
     println!("Collecting files...");
     
     // Use HashSet for in-memory duplicate detection
     let mut seen_paths: HashSet<String> = HashSet::new();
+    
+    // If incremental update, load existing paths from database
+    if !clear_existing && already_indexed {
+        println!("Loading existing files from database...");
+        match conn.prepare("SELECT path FROM files WHERE root_directory = ?1") {
+            Ok(mut stmt) => {
+                match stmt.query_map([&root_dir_str], |row| row.get::<_, String>(0)) {
+                    Ok(rows) => {
+                        for path_result in rows {
+                            if let Ok(path) = path_result {
+                                seen_paths.insert(path);
+                            }
+                        }
+                        println!("Loaded {} existing files, will skip them...", seen_paths.len());
+                    }
+                    Err(e) => eprintln!("Failed to query existing paths: {}", e)
+                }
+            }
+            Err(e) => eprintln!("Failed to prepare query: {}", e)
+        }
+    }
     
     // Collect all entries first (this is I/O bound and relatively fast)
     let entries: Vec<(String, String)> = WalkDir::new(path)
@@ -219,7 +355,13 @@ async fn index_directory(path: &Path) {
         .collect();
 
     let total_count = entries.len();
-    println!("Found {} unique items, inserting into database...", total_count);
+    
+    if total_count == 0 {
+        println!("No new files to index.");
+        return;
+    }
+    
+    println!("Found {} new items to insert into database...", total_count);
 
     // Start a transaction for bulk insert
     let tx = match conn.transaction() {
@@ -232,7 +374,7 @@ async fn index_directory(path: &Path) {
 
     // Use prepared statement for better performance
     // INSERT OR IGNORE handles any edge case duplicates at DB level (extra safety)
-    let mut stmt = match tx.prepare("INSERT OR IGNORE INTO files (path, name, indexed_at) VALUES (?1, ?2, ?3)") {
+    let mut stmt = match tx.prepare("INSERT OR IGNORE INTO files (path, name, root_directory, indexed_at) VALUES (?1, ?2, ?3, ?4)") {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to prepare statement: {}", e);
@@ -241,11 +383,16 @@ async fn index_directory(path: &Path) {
     };
 
     // Insert all entries
+    let mut inserted_count = 0;
     for (idx, (path_str, name)) in entries.iter().enumerate() {
-        let _ = stmt.execute(params![path_str, name, now]);
+        if let Ok(rows_changed) = stmt.execute(params![path_str, name, &root_dir_str, now]) {
+            if rows_changed > 0 {
+                inserted_count += 1;
+            }
+        }
         
         if (idx + 1) % 10000 == 0 {
-            println!("Inserted {} / {} items...", idx + 1, total_count);
+            println!("Processed {} / {} items...", idx + 1, total_count);
         }
     }
 
@@ -257,7 +404,7 @@ async fn index_directory(path: &Path) {
         return;
     }
 
-    println!("Indexing complete! Total files: {}", total_count);
+    println!("Indexing complete! Added {} new files (skipped {} existing)", inserted_count, total_count - inserted_count);
 }
 
 // Helper function to normalize strings by removing separators for better matching
@@ -268,7 +415,7 @@ fn normalize_for_matching(s: &str) -> String {
         .to_lowercase()
 }
 
-fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String], options: &SearchOptions) -> Vec<(i64, FileEntry)> {
+fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[String], favorites: &[String], options: &SearchOptions) -> Vec<(i64, FileEntry)> {
     // New smarter search:
     // - Tokenize the query by whitespace
     // - Prefer ordered substring matches in filename first, then in the joined path components
@@ -412,7 +559,9 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             if is_in_library_dir && !is_exact_match {
                 best_score = best_score / 4;
             }
+            // Boost for recent and favorite files
             if recent.contains(&path) { best_score *= 2; }
+            if favorites.contains(&path) { best_score *= 3; } // Favorites get 3x boost
             results.push((best_score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
             continue;
         }
@@ -429,6 +578,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                     score = score / 4; // Significantly reduce score for library files
                 }
                 if recent.contains(&path) { score *= 2; }
+                if favorites.contains(&path) { score *= 3; }
                 results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
                 continue;
             }
@@ -447,6 +597,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                         score = score / 4; // Significantly reduce score for library files
                     }
                     if recent.contains(&path) { score *= 2; }
+                    if favorites.contains(&path) { score *= 3; }
                     results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
                     continue;
                 }
@@ -462,6 +613,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                             score = score / 4; // Significantly reduce score for library files
                         }
                         if recent.contains(&path) { score *= 2; }
+                        if favorites.contains(&path) { score *= 3; }
                         results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
                     }
                 }
@@ -520,13 +672,14 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         return Ok(vec![]);
     }
 
-    let (files, recent) = {
+    let (files, recent, favorites) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
         // Check if this is a glob or regex pattern that needs all files
         let needs_all_files = query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
             || query.starts_with('/') && query.ends_with('/');
         
+        // SEARCH ALL FILES - no directory filtering
         let files: Vec<(String, String)> = if needs_all_files {
             // For pattern searches, try to optimize with database queries when possible
             if query.starts_with("*.") && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) {
@@ -560,8 +713,6 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             
             if words.len() > 1 {
                 // Multi-word query: check if ALL words appear in name/path (in any order)
-                // This handles cases like "gre word list" matching "grewordlist.txt"
-                // Use LOWER() for case-insensitive matching
                 let mut combined_query = String::from("SELECT path, name FROM files WHERE ");
                 for (i, word) in words.iter().enumerate() {
                     if i > 0 {
@@ -580,7 +731,6 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 results
             } else {
                 // Single word query: prioritize exact filename matches, then substring matches
-                // Use UNION to get exact matches first, then other matches
                 let query_lower = query.to_lowercase();
                 let mut stmt = db
                     .prepare("
@@ -622,7 +772,18 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             .filter_map(|r| r.ok())
             .collect();
 
-        (files, recent)
+        // Get favorite files for boost
+        let mut fav_stmt = db
+            .prepare("SELECT path FROM favorite_files")
+            .map_err(|e| e.to_string())?;
+
+        let favorites: Vec<String> = fav_stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        (files, recent, favorites)
     }; // Database lock is automatically released here
 
     // Check if query is a pattern (glob or regex)
@@ -676,12 +837,14 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                                 score = score / 4; // Significantly reduce score for library files
                             }
                                        
-                            // Boost score if file is in recent files
-                            let boosted_score = if recent.contains(&path) {
-                                score + 1000  // Additive boost instead of multiplicative to avoid overflow
-                            } else {
-                                score
-                            };
+                            // Boost score if file is in recent or favorite files
+                            let mut boosted_score = score;
+                            if recent.contains(&path) {
+                                boosted_score += 1000;  // Additive boost instead of multiplicative to avoid overflow
+                            }
+                            if favorites.contains(&path) {
+                                boosted_score += 2000;  // Favorites get even bigger boost
+                            }
                             
                             Some((
                                 boosted_score,
@@ -702,7 +865,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             },
             Err(_) => {
                 // If glob-to-regex conversion fails, fall back to new search
-                fuzzy_search_files(files, &query, &recent, &search_opts)
+                fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
             }
         }
     } else if is_regex_query {
@@ -747,12 +910,14 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                                 score = score / 4; // Significantly reduce score for library files
                             }
                                        
-                            // Boost score if file is in recent files
-                            let boosted_score = if recent.contains(&path) {
-                                score + 1000  // Additive boost instead of multiplicative
-                            } else {
-                                score
-                            };
+                            // Boost score if file is in recent or favorite files
+                            let mut boosted_score = score;
+                            if recent.contains(&path) {
+                                boosted_score += 1000;  // Additive boost instead of multiplicative
+                            }
+                            if favorites.contains(&path) {
+                                boosted_score += 2000;  // Favorites get even bigger boost
+                            }
                             
                             Some((
                                 boosted_score,
@@ -771,12 +936,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             },
             Err(_) => {
                 // If regex is invalid, fall back to new search
-                fuzzy_search_files(files, &query, &recent, &search_opts)
+                fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
             }
         }
     } else {
         // Handle improved search
-        fuzzy_search_files(files, &query, &recent, &search_opts)
+        fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
     };
 
     // Sort by score (descending) and limit early for better performance
@@ -969,13 +1134,117 @@ async fn debug_search_scores(state: State<'_, AppState>, query: String) -> Resul
         filename_only: true,
     };
     
-    let results = fuzzy_search_files(files, &query, &[], &options);
+    let results = fuzzy_search_files(files, &query, &[], &[], &options);
     
     let debug_output: Vec<(String, i64, String)> = results.iter()
         .map(|(score, entry)| (entry.name.clone(), *score, entry.path.clone()))
         .collect();
     
     Ok(debug_output)
+}
+
+#[tauri::command]
+async fn toggle_favorite(state: State<'_, AppState>, path: String) -> Result<bool, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    // Check if already favorited
+    let is_favorited: bool = db
+        .query_row(
+            "SELECT 1 FROM favorite_files WHERE path = ?1",
+            [&path],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    
+    if is_favorited {
+        // Remove from favorites
+        db.execute("DELETE FROM favorite_files WHERE path = ?1", [&path])
+            .map_err(|e| e.to_string())?;
+        Ok(false)
+    } else {
+        // Add to favorites
+        let name = Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        db.execute(
+            "INSERT OR REPLACE INTO favorite_files (path, name, favorited_at) VALUES (?1, ?2, ?3)",
+            params![&path, &name, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+async fn get_favorites(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    let mut stmt = db
+        .prepare("SELECT path FROM favorite_files ORDER BY favorited_at DESC")
+        .map_err(|e| e.to_string())?;
+    
+    let favorites: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    
+    Ok(favorites)
+}
+
+#[derive(Serialize)]
+struct IndexedDirectory {
+    path: String,
+    name: String,
+    is_active: bool,
+    indexed_at: i64,
+}
+
+#[tauri::command]
+async fn get_indexed_directories(state: State<'_, AppState>) -> Result<Vec<IndexedDirectory>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    let mut stmt = db
+        .prepare("SELECT path, name, is_active, indexed_at FROM indexed_directories ORDER BY indexed_at DESC")
+        .map_err(|e| e.to_string())?;
+    
+    let dirs: Vec<IndexedDirectory> = stmt
+        .query_map([], |row| {
+            Ok(IndexedDirectory {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                is_active: row.get::<_, i32>(2)? == 1,
+                indexed_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    
+    Ok(dirs)
+}
+
+#[tauri::command]
+async fn set_active_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    // Set all to inactive
+    db.execute("UPDATE indexed_directories SET is_active = 0", [])
+        .map_err(|e| e.to_string())?;
+    
+    // Set the selected one to active
+    db.execute("UPDATE indexed_directories SET is_active = 1 WHERE path = ?1", [&path])
+        .map_err(|e| e.to_string())?;
+    
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -990,16 +1259,22 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             start_indexing,
+            index_custom_folder,
             search_files,
             get_recent_files,
             open_file,
             open_file_with,
             get_file_info,
             get_index_status,
-            debug_search_scores
+            debug_search_scores,
+            toggle_favorite,
+            get_favorites,
+            get_indexed_directories,
+            set_active_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

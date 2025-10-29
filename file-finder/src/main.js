@@ -29,10 +29,35 @@ window.addEventListener("DOMContentLoaded", async () => {
   recentList = document.querySelector("#recent-list");
   indexStatusEl = document.querySelector("#index-status");
   indexBtn = document.querySelector("#index-btn");
+  const directorySelector = document.querySelector("#directory-selector");
+  
+  // Load indexed directories first
+  await loadIndexedDirectories();
 
   // Setup event listeners
   searchInput.addEventListener("input", handleSearch);
   searchInput.addEventListener("keydown", handleKeyboard);
+  
+  // Directory selector
+  if (directorySelector) {
+    directorySelector.addEventListener("change", async (e) => {
+      const selectedPath = e.target.value;
+      if (selectedPath) {
+        try {
+          await invoke("set_active_directory", { path: selectedPath });
+          // Refresh search results if there's a query
+          if (searchInput.value.trim()) {
+            handleSearch();
+          }
+          // Update status
+          const status = await invoke("get_index_status");
+          indexStatusEl.textContent = `${status.total_files} files indexed`;
+        } catch (error) {
+          console.error("Failed to switch directory:", error);
+        }
+      }
+    });
+  }
   
   // Global keyboard listener for vim navigation when not typing in search
   document.addEventListener("keydown", (e) => {
@@ -43,6 +68,100 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   
   indexBtn.addEventListener("click", startIndexing);
+  
+  // Index C: drive button
+  const indexCDriveBtn = document.querySelector("#index-c-drive-btn");
+  if (indexCDriveBtn) {
+    indexCDriveBtn.addEventListener("click", async () => {
+      const confirmed = confirm(
+        "⚠️ WARNING: Indexing the entire C:\\ drive may take a LONG time (30+ minutes) and use significant resources.\n\n" +
+        "This will index hundreds of thousands of files.\n\n" +
+        "Are you sure you want to continue?"
+      );
+      
+      if (!confirmed) return;
+      
+      try {
+        indexCDriveBtn.disabled = true;
+        indexCDriveBtn.textContent = "Indexing C:\\...";
+        indexStatusEl.textContent = "Indexing C:\\ drive (this may take 30+ minutes)...";
+        
+        await invoke("index_custom_folder", { path: "C:\\" });
+        
+        alert("C:\\ drive indexing started! Monitor the status for progress.");
+        
+        // Reload directory list
+        await loadIndexedDirectories();
+        
+        // Poll for status updates
+        const interval = setInterval(async () => {
+          await updateStatus();
+        }, 5000);
+        
+        // Stop polling after 1 hour
+        setTimeout(() => {
+          clearInterval(interval);
+          indexCDriveBtn.disabled = false;
+          indexCDriveBtn.textContent = "Index C:\\ Drive";
+        }, 3600000);
+      } catch (error) {
+        console.error("Failed to index C:\\ drive:", error);
+        alert("Failed to index C:\\ drive: " + error);
+        indexCDriveBtn.disabled = false;
+        indexCDriveBtn.textContent = "Index C:\\ Drive";
+      }
+    });
+  }
+  
+  // Index folder button
+  const indexFolderBtn = document.querySelector("#index-folder-btn");
+  indexFolderBtn.addEventListener("click", async () => {
+    console.log("Index folder button clicked!");
+    try {
+      // Check if dialog is available
+      console.log("Tauri object:", window.__TAURI__);
+      console.log("Dialog available:", window.__TAURI__?.dialog);
+      
+      // Use Tauri's dialog API to open folder picker
+      if (!window.__TAURI__?.dialog?.open) {
+        throw new Error("Tauri dialog plugin not available. Make sure tauri-plugin-dialog is installed.");
+      }
+      
+      const selected = await window.__TAURI__.dialog.open({
+        directory: true,
+        multiple: false,
+        title: 'Select folder to index'
+      });
+      
+      console.log("Selected folder:", selected);
+      
+      if (selected) {
+        indexStatusEl.textContent = `Indexing folder: ${selected}`;
+        indexFolderBtn.disabled = true;
+        
+        await invoke("index_custom_folder", { path: selected });
+        
+        // Reload directory list
+        await loadIndexedDirectories();
+        
+        // Poll for status updates
+        const interval = setInterval(async () => {
+          const status = await invoke("get_index_status");
+          indexStatusEl.textContent = `Indexed ${status.total_files} files`;
+        }, 1000);
+        
+        // Stop polling after 30 seconds
+        setTimeout(() => {
+          clearInterval(interval);
+          indexFolderBtn.disabled = false;
+        }, 30000);
+      }
+    } catch (error) {
+      console.error("Failed to index folder:", error);
+      alert("Failed to index folder: " + error);
+      indexFolderBtn.disabled = false;
+    }
+  });
   
   // Debug button
   const debugBtn = document.querySelector("#debug-btn");
@@ -131,11 +250,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Load initial status
   await updateStatus();
   
+  // Load indexed directories
+  await loadIndexedDirectories();
+  
   // Load recent files in the recent tab
   await loadRecentFiles();
 
-  // Auto-refresh status (less frequent to avoid development interruptions)
+  // Auto-refresh status and directory list (less frequent to avoid development interruptions)
   setInterval(updateStatus, 15000);
+  setInterval(loadIndexedDirectories, 30000); // Refresh directories every 30 seconds
   
   // Check for scheduled reindexing every hour
   checkScheduledReindex();
@@ -237,7 +360,7 @@ async function loadRecentFiles() {
 }
 
 // Render search results
-function renderSearchResults(results) {
+async function renderSearchResults(results) {
   if (results.length === 0) {
     if (searchInput.value.trim()) {
       resultsList.innerHTML = `
@@ -257,16 +380,51 @@ function renderSearchResults(results) {
     return;
   }
 
+  // Get recent files to check which results are recent
+  let recentPaths = new Set();
+  let favoritePaths = new Set();
+  try {
+    const recentFiles = await invoke("get_recent_files");
+    recentPaths = new Set(recentFiles.map(f => f.path));
+    
+    const favorites = await invoke("get_favorites");
+    favoritePaths = new Set(favorites);
+  } catch (error) {
+    console.error("Failed to load recent files/favorites for badges:", error);
+  }
+
   const html = results
     .map((file, index) => {
       const isSelected = index === selectedIndex && activeTab === 'search';
-      const ext = file.name.includes('.') ? file.name.split('.').pop().toUpperCase() : 'FILE';
+      
+      // Determine if it's a folder or file by checking the path
+      const isFolder = !file.name.includes('.') || 
+                       file.path.endsWith('\\') || 
+                       file.path.endsWith('/');
+      
+      // Get extension or set badge text
+      let ext;
+      if (isFolder) {
+        ext = 'FOLDER';
+      } else if (file.name.includes('.')) {
+        ext = file.name.split('.').pop().toUpperCase();
+      } else {
+        ext = 'FILE';
+      }
+      
+      const isRecent = recentPaths.has(file.path);
+      const isFavorite = favoritePaths.has(file.path);
 
       return `
         <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
           <div class="file-info-row">
+            <button class="favorite-btn ${isFavorite ? 'favorited' : ''}" data-path="${escapeHtml(file.path)}" title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}">
+              ${isFavorite ? '★' : '☆'}
+            </button>
             <div class="file-name">${escapeHtml(file.name)}</div>
-            <span class="file-ext-badge">${ext}</span>
+            ${isFavorite ? '<span class="fav-badge">FAV</span>' : ''}
+            ${isRecent ? '<span class="recent-badge">RECENT</span>' : ''}
+            <span class="file-ext-badge ${isFolder ? 'folder-badge' : ''}">${ext}</span>
             <button class="open-with-btn" data-path="${escapeHtml(file.path)}" title="Open with...">⚙</button>
           </div>
           <div class="file-path">${escapeHtml(file.path)}</div>
@@ -280,12 +438,56 @@ function renderSearchResults(results) {
   // Add click listeners for file items
   resultsList.querySelectorAll(".file-item").forEach((item) => {
     item.addEventListener("click", (e) => {
-      // Don't open if clicking the "Open with" button
-      if (e.target.classList.contains('open-with-btn')) {
+      // Don't open if clicking buttons or badges
+      if (e.target.classList.contains('open-with-btn') || 
+          e.target.classList.contains('favorite-btn') ||
+          e.target.classList.contains('fav-badge') ||
+          e.target.classList.contains('recent-badge') ||
+          e.target.classList.contains('file-ext-badge')) {
         return;
       }
+      
+      const index = parseInt(item.dataset.index);
+      selectedIndex = index;
+      
+      // Update visual selection
+      resultsList.querySelectorAll('.file-item').forEach(el => el.classList.remove('selected'));
+      item.classList.add('selected');
+      
       const path = item.dataset.path;
       openFile(path);
+    });
+  });
+
+  // Add click listeners for favorite buttons
+  resultsList.querySelectorAll(".favorite-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      try {
+        const isFavorited = await invoke("toggle_favorite", { path });
+        btn.textContent = isFavorited ? '★' : '☆';
+        btn.classList.toggle('favorited', isFavorited);
+        btn.title = isFavorited ? 'Remove from favorites' : 'Add to favorites';
+        
+        // Update the FAV badge
+        const fileItem = btn.closest('.file-item');
+        const favBadge = fileItem.querySelector('.fav-badge');
+        const fileName = fileItem.querySelector('.file-name');
+        
+        if (isFavorited && !favBadge) {
+          // Add FAV badge
+          const badge = document.createElement('span');
+          badge.className = 'fav-badge';
+          badge.textContent = 'FAV';
+          fileName.after(badge);
+        } else if (!isFavorited && favBadge) {
+          // Remove FAV badge
+          favBadge.remove();
+        }
+      } catch (error) {
+        console.error("Failed to toggle favorite:", error);
+      }
     });
   });
 
@@ -577,15 +779,32 @@ async function showOpenWithDialog(path) {
 // Start indexing
 async function startIndexing() {
   try {
+    console.log("Start indexing button clicked");
     indexBtn.disabled = true;
     indexBtn.textContent = "Indexing...";
-    await invoke("start_indexing");
-    showSuccess("Indexing started! This may take a few minutes.");
+    indexStatusEl.textContent = "Starting indexing...";
+    
+    const result = await invoke("start_indexing");
+    console.log("Indexing result:", result);
+    
+    indexStatusEl.textContent = "Indexing in progress...";
+    alert("Indexing started! This may take a few minutes. Watch the status for progress.");
+    
+    // Poll for status updates
+    const interval = setInterval(async () => {
+      await updateStatus();
+    }, 2000);
+    
+    // Stop polling after 2 minutes
+    setTimeout(() => {
+      clearInterval(interval);
+    }, 120000);
   } catch (error) {
     console.error("Failed to start indexing:", error);
-    showError("Failed to start indexing: " + error);
+    alert("Failed to start indexing: " + error);
     indexBtn.disabled = false;
-    indexBtn.textContent = "Start Indexing";
+    indexBtn.textContent = "Index Home Directory";
+    indexStatusEl.textContent = "Indexing failed";
   }
 }
 
@@ -594,19 +813,21 @@ async function updateStatus() {
   try {
     const status = await invoke("get_index_status");
     const count = status.total_files.toLocaleString();
+    
+    console.log("Index status:", status);
 
     if (status.total_files === 0) {
       indexStatusEl.textContent = "No files indexed yet";
       indexBtn.disabled = false;
-      indexBtn.textContent = "Start Indexing";
+      indexBtn.textContent = "Index Home Directory";
     } else {
       indexStatusEl.textContent = `${count} files indexed`;
-      indexBtn.textContent = "Re-index";
+      indexBtn.textContent = "Re-index Home Directory";
       indexBtn.disabled = false;
     }
   } catch (error) {
     console.error("Failed to get status:", error);
-    indexStatusEl.textContent = "Status unavailable";
+    indexStatusEl.textContent = "Status error: " + error;
   }
 }
 
@@ -672,6 +893,26 @@ function showError(message) {
   // You can implement a toast notification here
   console.error(message);
   alert(message);
+}
+
+// Load indexed directories into dropdown
+async function loadIndexedDirectories() {
+  try {
+    const directories = await invoke("get_indexed_directories");
+    const selector = document.querySelector("#directory-selector");
+    
+    if (directories.length === 0) {
+      selector.innerHTML = '<option value="">No directories indexed</option>';
+      return;
+    }
+    
+    selector.innerHTML = directories.map(dir => {
+      const label = dir.name || dir.path;
+      return `<option value="${dir.path}" ${dir.is_active ? 'selected' : ''}>${label}</option>`;
+    }).join('');
+  } catch (error) {
+    console.error("Failed to load directories:", error);
+  }
 }
 
 // Show success message

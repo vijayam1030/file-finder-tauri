@@ -10,7 +10,8 @@ use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use rayon::prelude::*;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchOptions {
@@ -77,6 +78,8 @@ pub struct FileEntry {
 
 pub struct AppState {
     db: Mutex<Connection>,
+    // Simple cache for recent search results (query -> (timestamp, results))
+    search_cache: Mutex<HashMap<String, (Instant, Vec<FileEntry>)>>,
 }
 
 // Fuzzy matching helper function
@@ -88,6 +91,196 @@ fn fuzzy_match_score(text: &str, pattern: &str) -> f32 {
     } else {
         0.0
     }
+}
+
+#[derive(Debug, Clone)]
+struct PatternInfo {
+    pattern_type: PatternType,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    can_use_sql_optimization: bool,
+    sql_like_pattern: Option<String>,
+    regex_pattern: String,
+}
+
+#[derive(Debug, Clone)]
+enum PatternType {
+    SimpleGlob,      // file* or *.ext
+    SimplePrefix,    // prefix.*
+    PrefixSuffix,    // prefix.*suffix
+    ComplexRegex,    // [a-z]+\d{2,4}
+    LiteralSearch,   // plain text
+}
+
+// Comprehensive regex pattern analyzer
+fn analyze_regex_pattern(query: &str) -> PatternInfo {
+    let trimmed = query.trim();
+    
+    // Handle slash-wrapped regex
+    let actual_pattern = if trimmed.starts_with('/') && trimmed.ends_with('/') && trimmed.len() > 2 {
+        &trimmed[1..trimmed.len()-1]
+    } else {
+        trimmed
+    };
+    
+    // Check if it's a simple glob pattern (only * and ? allowed)
+    if !actual_pattern.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) {
+        if actual_pattern.starts_with("*.") && actual_pattern.matches('*').count() == 1 {
+            // *.ext pattern
+            let extension = &actual_pattern[2..];
+            return PatternInfo {
+                pattern_type: PatternType::SimpleGlob,
+                prefix: None,
+                suffix: Some(extension.to_string()),
+                can_use_sql_optimization: true,
+                sql_like_pattern: Some(format!("%.{}", extension)),
+                regex_pattern: actual_pattern.to_string(),
+            };
+        } else if actual_pattern.ends_with('*') && actual_pattern.matches('*').count() == 1 {
+            // prefix* pattern
+            let prefix = &actual_pattern[..actual_pattern.len()-1];
+            return PatternInfo {
+                pattern_type: PatternType::SimpleGlob,
+                prefix: Some(prefix.to_string()),
+                suffix: None,
+                can_use_sql_optimization: true,
+                sql_like_pattern: Some(format!("{}%", prefix)),
+                regex_pattern: actual_pattern.to_string(),
+            };
+        }
+    }
+    
+    // Check for optimizable regex prefix patterns
+    if let Some(prefix) = extract_regex_prefix(actual_pattern) {
+        if actual_pattern.ends_with(".*") && prefix.len() >= 2 {
+            // Simple prefix.* pattern
+            return PatternInfo {
+                pattern_type: PatternType::SimplePrefix,
+                prefix: Some(prefix.clone()),
+                suffix: None,
+                can_use_sql_optimization: true,
+                sql_like_pattern: Some(format!("{}%", prefix)),
+                regex_pattern: actual_pattern.to_string(),
+            };
+        } else if let Some(suffix) = extract_regex_suffix(actual_pattern, &prefix) {
+            // prefix.*suffix pattern
+            return PatternInfo {
+                pattern_type: PatternType::PrefixSuffix,
+                prefix: Some(prefix.clone()),
+                suffix: Some(suffix),
+                can_use_sql_optimization: true,
+                sql_like_pattern: Some(format!("{}%", prefix)),
+                regex_pattern: actual_pattern.to_string(),
+            };
+        }
+    }
+    
+    // Check if it's just literal text (no regex metacharacters)
+    if !actual_pattern.chars().any(|c| ".*+?^${}[]()\\|".contains(c)) {
+        return PatternInfo {
+            pattern_type: PatternType::LiteralSearch,
+            prefix: None,
+            suffix: None,
+            can_use_sql_optimization: true,
+            sql_like_pattern: Some(format!("%{}%", actual_pattern)),
+            regex_pattern: actual_pattern.to_string(),
+        };
+    }
+    
+    // Complex regex pattern - needs full regex matching
+    PatternInfo {
+        pattern_type: PatternType::ComplexRegex,
+        prefix: extract_regex_prefix(actual_pattern),
+        suffix: None,
+        can_use_sql_optimization: false,
+        sql_like_pattern: None,
+        regex_pattern: actual_pattern.to_string(),
+    }
+}
+
+// Extract prefix from regex patterns like "^prefix.*" or "prefix.*"
+fn extract_regex_prefix(pattern: &str) -> Option<String> {
+    let pattern = if pattern.starts_with('^') { &pattern[1..] } else { pattern };
+    
+    // Find the first regex metacharacter
+    let mut prefix = String::new();
+    for ch in pattern.chars() {
+        if ".*+?{}[]()\\|$".contains(ch) {
+            break;
+        }
+        prefix.push(ch);
+    }
+    
+    if prefix.len() >= 2 && !prefix.is_empty() {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+// Extract suffix from prefix.*suffix patterns
+fn extract_regex_suffix(pattern: &str, prefix: &str) -> Option<String> {
+    let pattern = if pattern.starts_with('^') { &pattern[1..] } else { pattern };
+    let after_prefix = &pattern[prefix.len()..];
+    
+    if after_prefix.starts_with(".*") && after_prefix.len() > 2 {
+        let suffix = &after_prefix[2..];
+        // Check if suffix is simple (no complex regex)
+        if !suffix.chars().any(|c| ".*+?{}[]()\\|^$".contains(c)) && !suffix.is_empty() {
+            Some(suffix.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Convert a glob pattern to a regular expression
+/// Supports:
+/// - * matches any sequence of characters
+/// - ? matches any single character
+/// - [abc] matches any character in the set
+/// - [a-z] matches any character in the range
+/// - Everything else is treated literally
+fn build_glob_regex(pattern: &str) -> String {
+    let mut regex = String::with_capacity(pattern.len() * 2);
+    regex.push('^'); // Anchor to start
+    
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '[' => {
+                // Handle character classes like [abc] or [a-z]
+                regex.push('[');
+                while let Some(inner) = chars.next() {
+                    if inner == ']' {
+                        regex.push(']');
+                        break;
+                    }
+                    // Escape regex special characters within character class
+                    match inner {
+                        '^' | '-' | '\\' => {
+                            regex.push('\\');
+                            regex.push(inner);
+                        }
+                        _ => regex.push(inner),
+                    }
+                }
+            }
+            // Escape regex special characters
+            '.' | '+' | '(' | ')' | '{' | '}' | '|' | '^' | '$' | '\\' => {
+                regex.push('\\');
+                regex.push(ch);
+            }
+            _ => regex.push(ch),
+        }
+    }
+    
+    regex.push('$'); // Anchor to end
+    regex
 }
 
 impl AppState {
@@ -183,6 +376,18 @@ impl AppState {
             [],
         )?;
 
+        // Add composite index for name and path searches (for faster OR queries)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_name_path ON files(name, path)",
+            [],
+        )?;
+
+        // Add index for extension-based searches (optimized for *.ext patterns)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_name_suffix ON files(name COLLATE NOCASE)",
+            [],
+        )?;
+
         // Migrate existing databases - add root_directory column if it doesn't exist
         let has_root_directory: bool = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name='root_directory'",
@@ -207,6 +412,7 @@ impl AppState {
 
         Ok(AppState {
             db: Mutex::new(conn),
+            search_cache: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -715,242 +921,77 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         return Ok(vec![]);
     }
 
+    // Check cache first (for exact queries, cache for 30 seconds)
+    let cache_key = format!("{}:{:?}", query, search_opts);
+    {
+        let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
+        
+        // Clean old entries (simple cleanup - remove entries older than 60 seconds)
+        cache.retain(|_, (timestamp, _)| timestamp.elapsed().as_secs() < 60);
+        
+        // Check for cached result
+        if let Some((timestamp, cached_results)) = cache.get(&cache_key) {
+            if timestamp.elapsed().as_secs() < 30 {
+                println!("CACHE HIT: Returning {} cached results for '{}'", cached_results.len(), query);
+                return Ok(cached_results.clone());
+            }
+        }
+    }
+
     let (files, recent, favorites) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
-        // Check for simple prefix patterns that can be optimized with pure SQL
-        let is_simple_prefix = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-            && query.matches('*').count() == 1) ||
-            // Also detect regex patterns that are actually simple prefixes like "^multi.*" or "logge.*"
-            (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
-             !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*'])) ||
-            // Also detect patterns like "logge.*" (without ^)
-            (!query.starts_with('^') && query.ends_with(".*") && query.len() > 3 &&
-             !query[..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\', '*']));
-
-        // Check for optimizable prefix + suffix patterns like "^multi.*java" or "log.*py"
-        let is_prefix_suffix_pattern = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
-            !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\'])) ||
-            // Also support patterns without ^ like "log.*py"
-            (!query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") && !query.starts_with("*.") &&
-             !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']));
+        // Intelligent pattern analysis and optimization
+        let pattern_info = analyze_regex_pattern(&query);
+        println!("PATTERN ANALYSIS: {:?}", pattern_info);
         
-        // Additional debugging for prefix+suffix pattern detection
-        if query.starts_with('^') && query.contains(".*") {
-            println!("PREFIX+SUFFIX DEBUG: query='{}', starts_with_^=true, contains_.*=true, ends_with_.*={}, contains_exclusions={}", 
-                     query, query.ends_with(".*"), query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']));
-        }
-        
-        // Debug logging to trace path selection
-        println!("SEARCH DEBUG: query='{}', ends_with_*={}, star_count={}, is_simple_prefix={}", 
-                 query, query.ends_with('*'), query.matches('*').count(), is_simple_prefix);
-        println!("PATTERN DEBUG: is_prefix_suffix_pattern={}, starts_with_^={}, contains_.*={}, ends_with_.*={}", 
-                 is_prefix_suffix_pattern, query.starts_with('^'), query.contains(".*"), query.ends_with(".*"));
-        
-        // Check if this is a complex glob or regex pattern that needs pattern matching
-        let needs_pattern_matching = !is_simple_prefix && !is_prefix_suffix_pattern && 
-            (query.contains(['*', '?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-            || query.starts_with('/') && query.ends_with('/'));
-        
-        // SEARCH FILES - use different strategies based on query type
-        let files: Vec<(String, String, Option<i64>)> = if is_simple_prefix {
-            // FAST PATH: Simple prefix patterns - pure SQL, no pattern matching needed
-            let prefix = if query.starts_with('^') && query.ends_with(".*") {
-                // Handle "^multi.*" format - extract "multi"
-                &query[1..query.len()-2]
-            } else if query.ends_with(".*") && !query.starts_with('^') {
-                // Handle "logge.*" format - extract "logge"
-                &query[..query.len()-2]
-            } else if query.ends_with('*') {
-                // Handle "multi*" format - extract "multi"
-                &query[..query.len()-1]
-            } else {
-                ""
-            };
+        // SEARCH FILES - use optimized strategy based on pattern analysis
+        let files: Vec<(String, String, Option<i64>)> = if pattern_info.can_use_sql_optimization {
+            // OPTIMIZED PATH: Use SQL LIKE for pre-filtering
+            let start_time = Instant::now();
             
-            if prefix.len() >= 2 {
-                let start_time = std::time::Instant::now();
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY name LIMIT 500")
-                    .map_err(|e| e.to_string())?;
-                let like_pattern = format!("{}%", prefix);
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            if let Some(sql_pattern) = &pattern_info.sql_like_pattern {
+                let (query_sql, limit) = match pattern_info.pattern_type {
+                    PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
+                        // For *.ext patterns, search by name only with moderate limit
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY length(name), name LIMIT ?2", 5000)
+                    },
+                    PatternType::SimplePrefix => {
+                        // For prefix patterns, prioritize exact matches with higher limit
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name), name LIMIT ?2", 8000)
+                    },
+                    _ => {
+                        // For literal search and other patterns, use conservative limit with relevance ordering
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) OR LOWER(path) LIKE LOWER(?1) ORDER BY length(name), name LIMIT ?2", 3000)
+                    }
+                };
+                
+                let mut stmt = db.prepare(query_sql).map_err(|e| e.to_string())?;
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([sql_pattern, &limit.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
                 let duration = start_time.elapsed();
-                println!("FAST PATH: Simple prefix '{}' (from query '{}') found {} files in {}ms", prefix, query, results.len(), duration.as_millis());
+                println!("OPTIMIZED SQL: Pattern '{}' → SQL '{}' found {} files in {}ms", 
+                         query, sql_pattern, results.len(), duration.as_millis());
                 results
             } else {
                 vec![]
             }
-        } else if is_prefix_suffix_pattern {
-            // OPTIMIZED PATH: Patterns like "^multi.*java" or "log.*py" - use SQL prefix filtering + regex matching
-            println!("ENTERING PREFIX+SUFFIX PATH for query: '{}'", query);
-            let query_without_caret = if query.starts_with('^') { &query[1..] } else { &query };
-            let parts: Vec<&str> = query_without_caret.split(".*").collect();
-            println!("SPLIT DEBUG: parts={:?}", parts);
-            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                let prefix = parts[0];
-                let suffix = parts[1];
-                println!("OPTIMIZED PATH: Prefix+suffix pattern - prefix='{}', suffix='{}'", prefix, suffix);
-                
-                let start_time = Instant::now();
-                // Use SQL to pre-filter by prefix, then apply regex for full validation
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
-                    .map_err(|e| e.to_string())?;
-                let like_pattern = format!("{}%", prefix);
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                let duration = start_time.elapsed();
-                println!("OPTIMIZED PATH: Pre-filtered {} files with prefix '{}' in {}ms", results.len(), prefix, duration.as_millis());
-                
-                // Debug: show first few pre-filtered files
-                if results.len() > 0 {
-                    println!("SAMPLE PRE-FILTERED FILES:");
-                    for (i, (path, name, _)) in results.iter().take(5).enumerate() {
-                        println!("  {}. {} ({})", i + 1, name, path);
-                    }
-                } else {
-                    println!("WARNING: No files found with prefix '{}'", prefix);
-                }
-                
-                results
-            } else {
-                // Fallback to loading more files for complex patterns
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files LIMIT 15000")
-                    .map_err(|e| e.to_string())?;
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                println!("OPTIMIZED PATH: Loaded {} files for complex prefix+suffix pattern", results.len());
-                results
-            }
-        } else if needs_pattern_matching {
-            // For pattern searches, try to optimize with database queries when possible
-            if query.starts_with("*.") && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) {
-                // Simple extension glob like "*.java" - use database LIKE query
-                let extension = &query[2..]; // Remove "*."
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
-                    .map_err(|e| e.to_string())?;
-                let like_pattern = format!("%.{}", extension);
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                println!("Extension query '{}' found {} files", like_pattern, results.len());
-                results
-            } else if query.contains('*') && query.ends_with(".java") {
-                // Patterns like "Event*.java" - use optimized SQL query
-                let prefix = query.replace("*", "").replace(".java", "");
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND name LIKE '%.java' LIMIT 10000")
-                    .map_err(|e| e.to_string())?;
-                let like_pattern = format!("{}%", prefix);
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                println!("Optimized pattern query '{}' found {} files", like_pattern, results.len());
-                results
-            } else if query.contains('*') {
-                // Generic patterns like "multimodel*" - use optimized prefix search
-                let prefix = query.replace("*", "");
-                if !prefix.is_empty() && prefix.len() >= 2 {
-                    // Use database prefix search with optimized LIKE query
-                    let mut stmt = db
-                        .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
-                        .map_err(|e| e.to_string())?;
-                    let name_pattern = format!("{}%", prefix);
-                    let path_pattern = format!("%{}%", prefix);
-                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&name_pattern, &path_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                        .map_err(|e| e.to_string())?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    println!("Optimized prefix query '{}' found {} files", name_pattern, results.len());
-                    results
-                } else {
-                    // For very short prefixes or complex patterns, load more files
-                    let mut stmt = db
-                        .prepare("SELECT path, name, modified_at FROM files LIMIT 10000")
-                        .map_err(|e| e.to_string())?;
-                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                        .map_err(|e| e.to_string())?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    println!("Limited fallback query loaded {} files", results.len());
-                    results
-                }
-            } else {
-                // Complex patterns - load more files for better coverage
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files LIMIT 8000")
-                    .map_err(|e| e.to_string())?;
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                println!("Complex pattern fallback loaded {} files", results.len());
-                results
-            }
-        } else if query.len() >= 2 {
-            // For regular text searches, use LIKE to pre-filter
-            // Extract individual words for better pre-filtering
-            let words: Vec<&str> = query.split_whitespace().collect();
-            
-            if words.len() > 1 {
-                // Multi-word query: check if ALL words appear in name/path (in any order)
-                let mut combined_query = String::from("SELECT path, name, modified_at FROM files WHERE ");
-                for (i, word) in words.iter().enumerate() {
-                    if i > 0 {
-                        combined_query.push_str(" AND ");
-                    }
-                    let word_lower = word.to_lowercase();
-                    combined_query.push_str(&format!("(LOWER(name) LIKE '%{}%' OR LOWER(path) LIKE '%{}%')", word_lower, word_lower));
-                }
-                combined_query.push_str(" LIMIT 2000");
-                
-                let mut stmt = db.prepare(&combined_query).map_err(|e| e.to_string())?;
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                results
-            } else {
-                // Single word query: prioritize exact filename matches, then substring matches
-                let query_lower = query.to_lowercase();
-                let mut stmt = db
-                    .prepare("
-                        SELECT path, name, modified_at FROM files WHERE LOWER(name) = ?1
-                        UNION ALL
-                        SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE ?2 AND LOWER(name) != ?1
-                        LIMIT 1000
-                    ")
-                    .map_err(|e| e.to_string())?;
-                
-                let like_query = format!("%{}%", query_lower);
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&query_lower, &like_query], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                results
-            }
         } else {
-            // For single character queries, just limit heavily
-            let mut stmt = db
-                .prepare("SELECT path, name, modified_at FROM files LIMIT 500")
-                .map_err(|e| e.to_string())?;
+            // COMPLEX REGEX PATH: Load files for full regex matching
+            let start_time = Instant::now();
+            let limit = if pattern_info.prefix.is_some() { 15000 } else { 10000 };
             
+            let mut stmt = db
+                .prepare(&format!("SELECT path, name, modified_at FROM files LIMIT {}", limit))
+                .map_err(|e| e.to_string())?;
             let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .map_err(|e| e.to_string())?
                 .filter_map(|r| r.ok())
                 .collect();
+            let duration = start_time.elapsed();
+            println!("COMPLEX REGEX: Loaded {} files for pattern '{}' in {}ms", results.len(), query, duration.as_millis());
             results
         };
 
@@ -979,41 +1020,23 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         (files, recent, favorites)
     }; // Database lock is automatically released here
 
-    // Use the same pattern detection logic as used for file loading
-    let is_simple_prefix_result = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-        && query.matches('*').count() == 1) ||
-        // Also detect regex patterns that are actually simple prefixes like "^multi.*" or "logge.*"
-        (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
-         !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*'])) ||
-        // Also detect patterns like "logge.*" (without ^)
-        (!query.starts_with('^') && query.ends_with(".*") && query.len() > 3 &&
-         !query[..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\', '*']));
-
-    let is_prefix_suffix_result = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
-        !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\'])) ||
-        // Also support patterns without ^ like "log.*py"
-        (!query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") && !query.starts_with("*.") &&
-         !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']));
+    // Analyze the query pattern using our unified pattern analyzer
+    let pattern_info = analyze_regex_pattern(&query);
     
-    let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) && 
-        !is_simple_prefix_result && !is_prefix_suffix_result;
-    let is_regex_query = !is_glob_pattern && !is_simple_prefix_result && !is_prefix_suffix_result && 
-        (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
-        || (query.starts_with('/') && query.ends_with('/')));
+    println!("Pattern analysis for '{}': type={:?}, can_use_sql={}, prefix={:?}, suffix={:?}", 
+             query, pattern_info.pattern_type, pattern_info.can_use_sql_optimization, 
+             pattern_info.prefix, pattern_info.suffix);
     
-    println!("PROCESSING DEBUG: is_simple_prefix_result={}, is_prefix_suffix_result={}, is_glob_pattern={}, is_regex_query={}", 
-             is_simple_prefix_result, is_prefix_suffix_result, is_glob_pattern, is_regex_query);
-    
-    let mut results: Vec<(i64, FileEntry)> = if is_simple_prefix_result {
-        // HYBRID APPROACH: Fast exact matches + fuzzy search for better coverage
-        let prefix = &query[..query.len()-1]; // Remove the trailing *
-        
-        // Step 1: Get exact prefix matches (fast SQL)
-        println!("FAST PATH: Converting {} exact matches to FileEntry objects", files.len());
-        let mut exact_results: Vec<(i64, FileEntry)> = files.into_iter()
-            .map(|(path, name, modified_at)| {
-                // High score for exact prefix matches
-                let mut score = 5000;
+    // Process files based on pattern analysis
+    let mut results: Vec<(i64, FileEntry)> = match pattern_info.pattern_type {
+        PatternType::SimplePrefix => {
+            // For simple prefix patterns like "log*" or "^log.*"
+            let prefix = pattern_info.prefix.as_deref().unwrap_or("");
+            println!("Processing {} files for simple prefix pattern '{}'", files.len(), prefix);
+            
+            let mut exact_results: Vec<(i64, FileEntry)> = files.into_iter()
+                .map(|(path, name, modified_at)| {
+                    let mut score = 5000; // High score for prefix matches
                 
                 // Boost if file is recent or favorite
                 if recent.contains(&path) {
@@ -1033,96 +1056,38 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             })
             .collect();
 
-        // Step 2: If we have few exact matches, add fuzzy matches for better coverage
-        if exact_results.len() < 50 && prefix.len() >= 3 {
-            println!("Adding fuzzy search for broader coverage (query: '{}')", prefix);
             
-            // Get a broader set of files for fuzzy matching - use a new scope to manage the database connection
-            let fuzzy_files: Vec<(String, String, Option<i64>)> = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                let mut stmt = db
-                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
-                    .map_err(|e| e.to_string())?;
-                let broad_pattern = format!("%{}%", prefix);
-                let results = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                    .map_err(|e| e.to_string())?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                results
-            }; // Database connection is automatically dropped here
+            // Add fuzzy search if we have few exact matches
+            if exact_results.len() < 50 && prefix.len() >= 3 {
+                println!("Adding fuzzy search for broader coverage");
+                
+                let fuzzy_files: Vec<(String, String, Option<i64>)> = {
+                    let db = state.db.lock().map_err(|e| e.to_string())?;
+                    let mut stmt = db
+                        .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
+                        .map_err(|e| e.to_string())?;
+                    let broad_pattern = format!("%{}%", prefix);
+                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    results
+                };
             
-            // Apply fuzzy matching with lower scores
-            let fuzzy_results: Vec<(i64, FileEntry)> = fuzzy_files.into_iter()
-                .filter_map(|(path, name, modified_at)| {
-                    // Skip if we already have this file from exact matches
-                    if exact_results.iter().any(|(_, entry)| entry.path == path) {
-                        return None;
-                    }
-                    
-                    // Calculate fuzzy match score
-                    let name_score = fuzzy_match_score(&name.to_lowercase(), &prefix.to_lowercase());
-                    let path_score = fuzzy_match_score(&path.to_lowercase(), &prefix.to_lowercase());
-                    let best_score = name_score.max(path_score);
-                    
-                    if best_score > 0.6 { // Only include good fuzzy matches
-                        let mut score = (best_score * 3000.0) as i64; // Lower than exact matches
-                        
-                        // Boost if file is recent or favorite
-                        if recent.contains(&path) {
-                            score += 1000;
-                        }
-                        if favorites.contains(&path) {
-                            score += 2000;
-                        }
-                        
-                        Some((score, FileEntry {
-                            path,
-                            name,
-                            last_accessed: None,
-                            access_count: 0,
-                            modified_at,
-                        }))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            
-            println!("Added {} fuzzy matches to {} exact matches", fuzzy_results.len(), exact_results.len());
-            exact_results.extend(fuzzy_results);
-        }
-        
-        exact_results
-    } else if is_prefix_suffix_result {
-        // OPTIMIZED PREFIX+SUFFIX: Pre-filtered files, apply regex for exact matching
-        // For patterns without ^, we need to anchor them to match the whole filename
-        let regex_pattern = if query.starts_with('^') {
-            query.to_string()
-        } else {
-            format!("^{}$", query) // Add anchors for patterns like "log.*py"
-        };
-        println!("PREFIX+SUFFIX: Processing {} pre-filtered files with regex '{}' (original: '{}')", files.len(), regex_pattern, query);
-        match Regex::new(&regex_pattern) {
-            Ok(regex) => {
-                let mut match_count = 0;
-                let results: Vec<_> = files.into_iter()
+                
+                let fuzzy_results: Vec<(i64, FileEntry)> = fuzzy_files.into_iter()
                     .filter_map(|(path, name, modified_at)| {
-                        let name_match = regex.is_match(&name);
-                        let path_match = regex.is_match(&path);
-                        
-                        // Debug first few files
-                        if match_count < 5 {
-                            println!("  REGEX TEST: '{}' -> name_match={}, path_match={}", name, name_match, path_match);
+                        if exact_results.iter().any(|(_, entry)| entry.path == path) {
+                            return None;
                         }
                         
-                        if name_match || path_match {
-                            match_count += 1;
-                            if match_count <= 3 {
-                                println!("  MATCH #{}: {} ({})", match_count, name, path);
-                            }
-                            let mut score = if name_match { 4500 } else { 3500 };
+                        let name_score = fuzzy_match_score(&name.to_lowercase(), &prefix.to_lowercase());
+                        let path_score = fuzzy_match_score(&path.to_lowercase(), &prefix.to_lowercase());
+                        let best_score = name_score.max(path_score);
+                        
+                        if best_score > 0.6 {
+                            let mut score = (best_score * 3000.0) as i64;
                             
-                            // Boost if file is recent or favorite
                             if recent.contains(&path) {
                                 score += 1000;
                             }
@@ -1142,194 +1107,228 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         }
                     })
                     .collect();
+            
                 
-                println!("PREFIX+SUFFIX RESULT: Found {} matches", match_count);
-                results
-            },
-            Err(_) => {
-                // If regex fails, fallback to fuzzy search
-                let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
-                fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
+                println!("Added {} fuzzy matches to {} exact matches", fuzzy_results.len(), exact_results.len());
+                exact_results.extend(fuzzy_results);
             }
+            
+            exact_results
         }
-    } else if is_glob_pattern {
-        // Handle glob pattern search (convert to regex)
-        println!("Detected glob pattern: '{}', processing {} files", query, files.len());
-        let regex_pattern = glob_to_regex(&query);
-        println!("Converted to regex: '{}'", regex_pattern);
-        let total_files = files.len(); // Store length before consuming files
-        match Regex::new(&regex_pattern) {
-            Ok(regex) => {
-                let mut match_count = 0;
-                let mut java_file_count = 0;
-                let results: Vec<_> = files.into_iter()
-                    .take(10000) // Limit processing to first 10k files for performance
-                    .filter_map(|(path, name, modified_at)| {
-                        // Check if file is in a library/build directory
-                        let is_in_library_dir = is_library_file(&path);
-
-                        // Check regex match against filename, path components, and full path
-                        let name_match = regex.is_match(&name);
-                        let path_components: Vec<&str> = path.split(['/', '\\'])
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        let path_component_match = path_components.iter().any(|component| regex.is_match(component));
-                        let full_path_match = regex.is_match(&path);
-
-                        // Debug: check for java files specifically and also show what IS matching
-                        if name.to_lowercase().ends_with(".java") {
-                            java_file_count += 1;
-                            if java_file_count <= 5 {
-                                println!("Java file #{}: '{}' - Testing regex '{}' - name_match: {}, path_component_match: {}, full_path_match: {}", 
-                                         java_file_count, name, regex_pattern, name_match, path_component_match, full_path_match);
-                            }
-                        }
-                        
-                        // Debug: show first few matches regardless of extension
-                        if (name_match || path_component_match || full_path_match) && match_count < 5 {
-                            println!("MATCH #{}: '{}' (path: {}) - name_match: {}, path_component_match: {}, full_path_match: {}", 
-                                     match_count + 1, name, path, name_match, path_component_match, full_path_match);
-                        }
-                        
-                        if name_match || path_component_match || full_path_match {
-                            match_count += 1;
-                            // Use improved scoring logic similar to the new search function
-                            let mut score = if name_match { 
-                                // Exact filename pattern match gets highest priority
-                                5000 
-                            } else if path_component_match { 
-                                // Folder name pattern match gets good priority
-                                3000 
-                            } else { 
-                                // Full path match gets lower priority
-                                1500 
-                            };
-
-                            // Deprioritize library/build directories
-                            if is_in_library_dir {
-                                score = score / 4; // Significantly reduce score for library files
-                            }
-                                       
-                            // Boost score if file is in recent or favorite files
-                            let mut boosted_score = score;
-                            if recent.contains(&path) {
-                                boosted_score += 1000;  // Additive boost instead of multiplicative to avoid overflow
-                            }
-                            if favorites.contains(&path) {
-                                boosted_score += 2000;  // Favorites get even bigger boost
-                            }
-                            
-                            Some((
-                                boosted_score,
-                                FileEntry {
-                                    path: path.clone(),
-                                    name,
-                                    last_accessed: None,
-                                    access_count: 0,
-                                    modified_at,
-                                },
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                println!("Glob pattern '{}' matched {} files out of {} total files ({} java files checked)", 
-                         query, match_count, total_files, java_file_count);
-                results
-            },
-            Err(_) => {
-                // If glob-to-regex conversion fails, fall back to fuzzy search
-                // But first we need to convert the 3-tuple format to 2-tuple format for the fuzzy search
-                let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
-                fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
-            }
-        }
-    } else if is_regex_query {
-        // Handle regex search
-        let regex_pattern = if query.starts_with('/') && query.ends_with('/') && query.len() > 2 {
-            // Remove surrounding slashes for /pattern/ syntax
-            &query[1..query.len()-1]
-        } else {
-            &query
-        };
         
-        match Regex::new(regex_pattern) {
-            Ok(regex) => {
-                files.into_iter()
-                    .filter_map(|(path, name, modified_at)| {
-                        // Check if file is in a library/build directory
-                        let is_in_library_dir = is_library_file(&path);
-
-                        // Check regex match against filename, path components, and full path
-                        let name_match = regex.is_match(&name);
-                        let path_components: Vec<&str> = path.split(['/', '\\'])
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        let path_component_match = path_components.iter().any(|component| regex.is_match(component));
-                        let full_path_match = regex.is_match(&path);
-                        
-                        if name_match || path_component_match || full_path_match {
-                            // Use improved scoring logic consistent with new search function
-                            let mut score = if name_match { 
-                                // Exact filename regex match gets highest priority
-                                5000 
-                            } else if path_component_match { 
-                                // Folder name regex match gets good priority
-                                3000 
-                            } else { 
-                                // Full path regex match gets lower priority
-                                1500 
+        PatternType::SimpleGlob | PatternType::PrefixSuffix | PatternType::ComplexRegex => {
+            // For patterns that need regex matching
+            let regex_pattern = match pattern_info.pattern_type {
+                PatternType::SimpleGlob => build_glob_regex(&query),
+                PatternType::PrefixSuffix => {
+                    if query.starts_with('^') {
+                        query.to_string()
+                    } else {
+                        format!("^{}$", query)
+                    }
+                }
+                PatternType::ComplexRegex => {
+                    if query.starts_with('/') && query.ends_with('/') {
+                        query[1..query.len()-1].to_string()
+                    } else {
+                        query.to_string()
+                    }
+                }
+                _ => unreachable!()
+            };
+            
+            println!("Processing {} files with regex '{}' for pattern type {:?}", 
+                     files.len(), regex_pattern, pattern_info.pattern_type);
+            
+            match Regex::new(&regex_pattern) {
+                Ok(re) => {
+                    // Use parallel processing for large file sets (>1000 files)
+                    let matched_files: Vec<(i64, FileEntry)> = if files.len() > 1000 {
+                        files.into_par_iter()
+                            .filter_map(|(path, name, modified_at)| {
+                                if re.is_match(&name) || re.is_match(&path) {
+                                    let mut score = 4000;
+                                    
+                                    if recent.contains(&path) {
+                                        score += 1000;
+                                    }
+                                    if favorites.contains(&path) {
+                                        score += 2000;
+                                    }
+                                    
+                                    Some((score, FileEntry {
+                                        path,
+                                        name,
+                                        last_accessed: None,
+                                        access_count: 0,
+                                        modified_at,
+                                    }))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        // For smaller sets, sequential processing is faster due to reduced overhead
+                        files.into_iter()
+                            .filter_map(|(path, name, modified_at)| {
+                                if re.is_match(&name) || re.is_match(&path) {
+                                    let mut score = 4000;
+                                    
+                                    if recent.contains(&path) {
+                                        score += 1000;
+                                    }
+                                    if favorites.contains(&path) {
+                                        score += 2000;
+                                    }
+                                    
+                                    Some((score, FileEntry {
+                                        path,
+                                        name,
+                                        last_accessed: None,
+                                        access_count: 0,
+                                        modified_at,
+                                    }))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+                    
+                    println!("Regex matched {} files", matched_files.len());
+                    
+                    // Add fuzzy search fallback for complex patterns with few matches
+                    let mut matched_files = matched_files; // Make mutable for potential extension
+                    if matches!(pattern_info.pattern_type, PatternType::PrefixSuffix | PatternType::ComplexRegex) && matched_files.len() < 20 {
+                        let clean_query = query.replace("^", "").replace(".*", "").replace("$", "").replace(r"\.", ".");
+                        if clean_query.len() >= 3 {
+                            println!("Adding fuzzy search fallback for '{}'", clean_query);
+                            
+                            let files_2tuple: Vec<(String, String)> = {
+                                let db = state.db.lock().map_err(|e| e.to_string())?;
+                                let mut stmt = db
+                                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
+                                    .map_err(|e| e.to_string())?;
+                                let broad_pattern = format!("%{}%", clean_query);
+                                let results: Vec<(String, String)> = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                                    .map_err(|e| e.to_string())?
+                                    .filter_map(|r| r.ok())
+                                    .collect();
+                                results
                             };
-
-                            // Deprioritize library/build directories
-                            if is_in_library_dir {
-                                score = score / 4; // Significantly reduce score for library files
-                            }
-                                       
-                            // Boost score if file is in recent or favorite files
-                            let mut boosted_score = score;
-                            if recent.contains(&path) {
-                                boosted_score += 1000;  // Additive boost instead of multiplicative
-                            }
-                            if favorites.contains(&path) {
-                                boosted_score += 2000;  // Favorites get even bigger boost
+                            
+                            let fuzzy_results = fuzzy_search_files(files_2tuple, &clean_query, &recent, &favorites, &search_opts);
+                            
+                            for (score, entry) in fuzzy_results {
+                                if !matched_files.iter().any(|(_, existing)| existing.path == entry.path) {
+                                    matched_files.push((score / 2, entry));
+                                }
                             }
                             
-                            Some((
-                                boosted_score,
-                                FileEntry {
-                                    path: path.clone(),
-                                    name,
-                                    last_accessed: None,
-                                    access_count: 0,
-                                    modified_at,
-                                },
-                            ))
-                        } else {
-                            None
+                            println!("Added fuzzy matches, total now: {}", matched_files.len());
                         }
+                    }
+                    
+                    matched_files
+                }
+                Err(_) => {
+                    println!("Invalid regex '{}', falling back to fuzzy search", regex_pattern);
+                    let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+                    fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
+                }
+            }
+        }
+        
+        PatternType::LiteralSearch => {
+            // For simple text searches, use SQL optimization if available, otherwise fuzzy search
+            if pattern_info.can_use_sql_optimization && !files.is_empty() {
+                println!("Using SQL-optimized literal search for pattern '{}' on {} pre-filtered files", query, files.len());
+                // Convert SQL-optimized results to scored FileEntry format
+                files.into_iter()
+                    .map(|(path, name, modified_at)| {
+                        // Score based on how well the query matches (case-insensitive substring match)
+                        let name_lower = name.to_lowercase();
+                        let query_lower = query.to_lowercase();
+                        let mut score = if name_lower.contains(&query_lower) {
+                            if name_lower == query_lower {
+                                5000 // Exact match
+                            } else if name_lower.starts_with(&query_lower) {
+                                4000 // Starts with query
+                            } else {
+                                3000 // Contains query
+                            }
+                        } else {
+                            // Check path match
+                            let path_lower = path.to_lowercase();
+                            if path_lower.contains(&query_lower) {
+                                2000 // Path contains query
+                            } else {
+                                1000 // SQL matched but we're not sure why
+                            }
+                        };
+                        
+                        // Boost for recent/favorite files
+                        if recent.contains(&path) {
+                            score += 1000;
+                        }
+                        if favorites.contains(&path) {
+                            score += 2000;
+                        }
+                        
+                        (score, FileEntry {
+                            path,
+                            name,
+                            last_accessed: None,
+                            access_count: 0,
+                            modified_at,
+                        })
                     })
                     .collect()
-            },
-            Err(_) => {
-                // If regex is invalid, fall back to fuzzy search
-                // Convert 3-tuple format to 2-tuple format for the fuzzy search
+            } else {
+                println!("Using fuzzy search for literal pattern '{}'", query);
                 let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
                 fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
             }
         }
-    } else {
-        // Handle improved search - convert 3-tuple to 2-tuple for fuzzy search
-        let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
-        fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
     };
 
-    // Sort by score (descending) and limit early for better performance
-    results.sort_by(|a, b| b.0.cmp(&a.0));
+    // Early termination optimization: if we have many high-quality results, 
+    // we can skip processing the rest for better performance
+    if results.len() > 2000 {
+        // Partial sort to get top candidates quickly
+        results.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        
+        // Check if we have enough high-quality results (score > 6000)
+        let high_quality_count = results.iter().take(1500).filter(|(score, _)| *score > 6000).count();
+        if high_quality_count > 500 {
+            println!("EARLY TERMINATION: Found {} high-quality results, truncating to top 1500", high_quality_count);
+            results.truncate(1500);
+        }
+    } else {
+        // Full sort for smaller result sets
+        results.sort_by(|a, b| b.0.cmp(&a.0));
+    }
 
-    // Return top 1000 results for faster response
-    Ok(results.into_iter().take(1000).map(|(_, entry)| entry).collect())
+    // Prepare final results with optimized limit
+    let final_results: Vec<FileEntry> = results.into_iter().take(1000).map(|(_, entry)| entry).collect();
+    
+    // Cache the results for future queries (limit cache size to 100 entries)
+    {
+        let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
+        if cache.len() >= 100 {
+            // Remove oldest entries if cache is full
+            let oldest_key = cache.iter()
+                .min_by_key(|(_, (timestamp, _))| timestamp)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest_key {
+                cache.remove(&key);
+            }
+        }
+        cache.insert(cache_key, (Instant::now(), final_results.clone()));
+    }
+
+    Ok(final_results)
 }
 
 #[tauri::command]

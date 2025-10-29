@@ -28,33 +28,60 @@ window.addEventListener("DOMContentLoaded", async () => {
   resultsList = document.querySelector("#results-list");
   recentList = document.querySelector("#recent-list");
   indexStatusEl = document.querySelector("#index-status");
-  indexBtn = document.querySelector("#index-btn");
-  const directorySelector = document.querySelector("#directory-selector");
   
-  // Load indexed directories first
-  await loadIndexedDirectories();
-
   // Setup event listeners
   searchInput.addEventListener("input", handleSearch);
   searchInput.addEventListener("keydown", handleKeyboard);
   
-  // Directory selector
-  if (directorySelector) {
-    directorySelector.addEventListener("change", async (e) => {
-      const selectedPath = e.target.value;
-      if (selectedPath) {
-        try {
-          await invoke("set_active_directory", { path: selectedPath });
-          // Refresh search results if there's a query
-          if (searchInput.value.trim()) {
-            handleSearch();
-          }
-          // Update status
-          const status = await invoke("get_index_status");
-          indexStatusEl.textContent = `${status.total_files} files indexed`;
-        } catch (error) {
-          console.error("Failed to switch directory:", error);
+  // Global keyboard listener for vim navigation when not typing in search
+  document.addEventListener("keydown", (e) => {
+    // Only handle global keys when search input is not focused
+    if (document.activeElement !== searchInput) {
+      handleKeyboard(e);
+    }
+  });
+  
+  // Re-index button - open folder dialog to select what to index
+  const indexFolderBtn = document.querySelector("#index-folder-btn");
+  if (indexFolderBtn) {
+    indexFolderBtn.addEventListener("click", async () => {
+      try {
+        // Use Tauri's dialog API to open folder picker
+        if (!window.__TAURI__?.dialog?.open) {
+          throw new Error("Tauri dialog plugin not available.");
         }
+        
+        const selected = await window.__TAURI__.dialog.open({
+          directory: true,
+          multiple: false,
+          title: 'Select folder to re-index'
+        });
+        
+        if (selected) {
+          indexStatusEl.textContent = `Indexing: ${selected}`;
+          indexFolderBtn.disabled = true;
+          indexFolderBtn.textContent = "Indexing...";
+          
+          await invoke("index_custom_folder", { path: selected });
+          
+          // Poll for status updates
+          const interval = setInterval(async () => {
+            const status = await invoke("get_index_status");
+            indexStatusEl.textContent = `${status.total_files.toLocaleString()} files indexed`;
+          }, 2000);
+          
+          // Stop polling after 2 minutes
+          setTimeout(() => {
+            clearInterval(interval);
+            indexFolderBtn.disabled = false;
+            indexFolderBtn.textContent = "Re-index";
+          }, 120000);
+        }
+      } catch (error) {
+        console.error("Failed to index folder:", error);
+        alert("Failed to index folder: " + error);
+        indexFolderBtn.disabled = false;
+        indexFolderBtn.textContent = "Re-index";
       }
     });
   }
@@ -65,118 +92,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (document.activeElement !== searchInput) {
       handleKeyboard(e);
     }
-  });
-  
-  indexBtn.addEventListener("click", startIndexing);
-  
-  // Index C: drive button
-  const indexCDriveBtn = document.querySelector("#index-c-drive-btn");
-  if (indexCDriveBtn) {
-    indexCDriveBtn.addEventListener("click", async () => {
-      const confirmed = confirm(
-        "⚠️ WARNING: Indexing the entire C:\\ drive may take a LONG time (30+ minutes) and use significant resources.\n\n" +
-        "This will index hundreds of thousands of files.\n\n" +
-        "Are you sure you want to continue?"
-      );
-      
-      if (!confirmed) return;
-      
-      try {
-        indexCDriveBtn.disabled = true;
-        indexCDriveBtn.textContent = "Indexing C:\\...";
-        indexStatusEl.textContent = "Indexing C:\\ drive (this may take 30+ minutes)...";
-        
-        await invoke("index_custom_folder", { path: "C:\\" });
-        
-        alert("C:\\ drive indexing started! Monitor the status for progress.");
-        
-        // Reload directory list
-        await loadIndexedDirectories();
-        
-        // Poll for status updates
-        const interval = setInterval(async () => {
-          await updateStatus();
-        }, 5000);
-        
-        // Stop polling after 1 hour
-        setTimeout(() => {
-          clearInterval(interval);
-          indexCDriveBtn.disabled = false;
-          indexCDriveBtn.textContent = "Index C:\\ Drive";
-        }, 3600000);
-      } catch (error) {
-        console.error("Failed to index C:\\ drive:", error);
-        alert("Failed to index C:\\ drive: " + error);
-        indexCDriveBtn.disabled = false;
-        indexCDriveBtn.textContent = "Index C:\\ Drive";
-      }
-    });
-  }
-  
-  // Index folder button
-  const indexFolderBtn = document.querySelector("#index-folder-btn");
-  indexFolderBtn.addEventListener("click", async () => {
-    console.log("Index folder button clicked!");
-    try {
-      // Check if dialog is available
-      console.log("Tauri object:", window.__TAURI__);
-      console.log("Dialog available:", window.__TAURI__?.dialog);
-      
-      // Use Tauri's dialog API to open folder picker
-      if (!window.__TAURI__?.dialog?.open) {
-        throw new Error("Tauri dialog plugin not available. Make sure tauri-plugin-dialog is installed.");
-      }
-      
-      const selected = await window.__TAURI__.dialog.open({
-        directory: true,
-        multiple: false,
-        title: 'Select folder to index'
-      });
-      
-      console.log("Selected folder:", selected);
-      
-      if (selected) {
-        indexStatusEl.textContent = `Indexing folder: ${selected}`;
-        indexFolderBtn.disabled = true;
-        
-        await invoke("index_custom_folder", { path: selected });
-        
-        // Reload directory list
-        await loadIndexedDirectories();
-        
-        // Poll for status updates
-        const interval = setInterval(async () => {
-          const status = await invoke("get_index_status");
-          indexStatusEl.textContent = `Indexed ${status.total_files} files`;
-        }, 1000);
-        
-        // Stop polling after 30 seconds
-        setTimeout(() => {
-          clearInterval(interval);
-          indexFolderBtn.disabled = false;
-        }, 30000);
-      }
-    } catch (error) {
-      console.error("Failed to index folder:", error);
-      alert("Failed to index folder: " + error);
-      indexFolderBtn.disabled = false;
-    }
-  });
-  
-  // Debug button
-  const debugBtn = document.querySelector("#debug-btn");
-  debugBtn.addEventListener("click", async () => {
-    const query = searchInput.value.trim();
-    if (!query) {
-      alert("Enter a search query first");
-      return;
-    }
-    const results = await invoke("debug_search_scores", { query });
-    console.log("Debug scores for:", query);
-    results.forEach(([name, score, path]) => {
-      console.log(`${score}: ${name} (${path})`);
-    });
-    alert(`Check console for debug scores (${results.length} results)`);
   });
   
   // Setup settings panel
@@ -250,15 +165,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Load initial status
   await updateStatus();
   
-  // Load indexed directories
-  await loadIndexedDirectories();
-  
   // Load recent files in the recent tab
   await loadRecentFiles();
 
-  // Auto-refresh status and directory list (less frequent to avoid development interruptions)
+  // Auto-refresh status (less frequent to avoid development interruptions)
   setInterval(updateStatus, 15000);
-  setInterval(loadIndexedDirectories, 30000); // Refresh directories every 30 seconds
   
   // Check for scheduled reindexing every hour
   checkScheduledReindex();
@@ -816,18 +727,21 @@ async function updateStatus() {
     
     console.log("Index status:", status);
 
+    if (!indexStatusEl) {
+      console.error("indexStatusEl is not defined");
+      return;
+    }
+
     if (status.total_files === 0) {
       indexStatusEl.textContent = "No files indexed yet";
-      indexBtn.disabled = false;
-      indexBtn.textContent = "Index Home Directory";
     } else {
       indexStatusEl.textContent = `${count} files indexed`;
-      indexBtn.textContent = "Re-index Home Directory";
-      indexBtn.disabled = false;
     }
   } catch (error) {
     console.error("Failed to get status:", error);
-    indexStatusEl.textContent = "Status error: " + error;
+    if (indexStatusEl) {
+      indexStatusEl.textContent = "Status error: " + error;
+    }
   }
 }
 

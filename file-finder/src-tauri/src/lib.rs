@@ -1065,24 +1065,43 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             let mut exact_results: Vec<(i64, FileEntry)> = files.into_iter()
                 .take(200) // Early termination for 1.5M files - stop after 200 good results
                 .map(|(path, name, modified_at)| {
-                    let mut score = 5000; // High score for prefix matches
+                    let prefix = pattern_info.prefix.as_deref().unwrap_or("");
+                    let name_lower = name.to_lowercase();
+                    let prefix_lower = prefix.to_lowercase();
+                    
+                    let mut score = if name_lower == prefix_lower {
+                        15000 // Exact filename match - highest priority!
+                    } else {
+                        // Check if prefix matches filename without extension
+                        let name_without_ext = if let Some(dot_pos) = name_lower.rfind('.') {
+                            &name_lower[..dot_pos]
+                        } else {
+                            &name_lower
+                        };
+                        
+                        if name_without_ext == prefix_lower {
+                            14000 // Exact match without extension - very high priority!
+                        } else {
+                            5000 // Regular prefix match
+                        }
+                    };
                 
-                // Boost if file is recent or favorite
-                if recent.contains(&path) {
-                    score += 1000;
-                }
-                if favorites.contains(&path) {
-                    score += 2000;
-                }
-                
-                (score, FileEntry {
-                    path,
-                    name,
-                    last_accessed: None,
-                    access_count: 0,
-                    modified_at,
+                    // Boost if file is recent or favorite
+                    if recent.contains(&path) {
+                        score += 1000;
+                    }
+                    if favorites.contains(&path) {
+                        score += 2000;
+                    }
+                    
+                    (score, FileEntry {
+                        path,
+                        name,
+                        last_accessed: None,
+                        access_count: 0,
+                        modified_at,
+                    })
                 })
-            })
             .collect();
 
             
@@ -1205,7 +1224,25 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .take(300) // Early termination - only process first 300 files for regex
                     .filter_map(|(path, name, modified_at)| {
                         if re.is_match(&name) || re.is_match(&path) {
-                            let mut score = 4000;
+                            let name_lower = name.to_lowercase();
+                            let query_lower = query.to_lowercase();
+                            
+                            let mut score = if name_lower == query_lower {
+                                15000 // Exact filename match - highest priority!
+                            } else {
+                                // Check if query matches filename without extension
+                                let name_without_ext = if let Some(dot_pos) = name_lower.rfind('.') {
+                                    &name_lower[..dot_pos]
+                                } else {
+                                    &name_lower
+                                };
+                                
+                                if name_without_ext == query_lower {
+                                    14000 // Exact match without extension - very high priority!
+                                } else {
+                                    4000 // Regular regex match
+                                }
+                            };
                             
                             if recent.contains(&path) {
                                 score += 1000;
@@ -1232,7 +1269,25 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .take(200) // Early termination for sequential processing too
                     .filter_map(|(path, name, modified_at)| {
                         if re.is_match(&name) || re.is_match(&path) {
-                            let mut score = 4000;
+                            let name_lower = name.to_lowercase();
+                            let query_lower = query.to_lowercase();
+                            
+                            let mut score = if name_lower == query_lower {
+                                15000 // Exact filename match - highest priority!
+                            } else {
+                                // Check if query matches filename without extension
+                                let name_without_ext = if let Some(dot_pos) = name_lower.rfind('.') {
+                                    &name_lower[..dot_pos]
+                                } else {
+                                    &name_lower
+                                };
+                                
+                                if name_without_ext == query_lower {
+                                    14000 // Exact match without extension - very high priority!
+                                } else {
+                                    4000 // Regular regex match
+                                }
+                            };
                             
                             if recent.contains(&path) {
                                 score += 1000;
@@ -1307,11 +1362,22 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         
                         let mut score = if name_lower.contains(&query_lower) {
                             if name_lower == query_lower {
-                                5000 // Exact match
-                            } else if name_lower.starts_with(&query_lower) {
-                                4000 // Starts with query
+                                15000 // Exact filename match - highest priority!
                             } else {
-                                3000 // Contains query
+                                // Check if query matches filename without extension
+                                let name_without_ext = if let Some(dot_pos) = name_lower.rfind('.') {
+                                    &name_lower[..dot_pos]
+                                } else {
+                                    &name_lower
+                                };
+                                
+                                if name_without_ext == query_lower {
+                                    14000 // Exact match without extension - very high priority!
+                                } else if name_lower.starts_with(&query_lower) {
+                                    4000 // Starts with query
+                                } else {
+                                    3000 // Contains query
+                                }
                             }
                         } else if path_lower.contains(&query_lower) {
                             2000 // Path contains query

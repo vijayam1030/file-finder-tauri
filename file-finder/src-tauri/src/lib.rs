@@ -695,10 +695,48 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .collect();
                 println!("Extension query '{}' found {} files", like_pattern, results.len());
                 results
-            } else {
-                // Complex patterns - get more files but still limit for performance
+            } else if query.contains('*') && query.ends_with(".java") {
+                // Patterns like "Event*.java" - use optimized SQL query
+                let prefix = query.replace("*", "").replace(".java", "");
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files LIMIT 20000")
+                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 AND name LIKE '%.java' LIMIT 10000")
+                    .map_err(|e| e.to_string())?;
+                let like_pattern = format!("{}%", prefix);
+                let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                println!("Optimized pattern query '{}' found {} files", like_pattern, results.len());
+                results
+            } else if query.contains('*') {
+                // Generic patterns like "Event*" - use prefix search
+                let prefix = query.replace("*", "");
+                if !prefix.is_empty() {
+                    let mut stmt = db
+                        .prepare("SELECT path, name FROM files WHERE name LIKE ?1 LIMIT 10000")
+                        .map_err(|e| e.to_string())?;
+                    let like_pattern = format!("{}%", prefix);
+                    let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    println!("Prefix query '{}' found {} files", like_pattern, results.len());
+                    results
+                } else {
+                    // Fallback for complex patterns - limit to reasonable number
+                    let mut stmt = db
+                        .prepare("SELECT path, name FROM files LIMIT 50000")
+                        .map_err(|e| e.to_string())?;
+                    let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    results
+                }
+            } else {
+                // Complex patterns - limit to reasonable number
+                let mut stmt = db
+                    .prepare("SELECT path, name FROM files LIMIT 50000")
                     .map_err(|e| e.to_string())?;
                 let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                     .map_err(|e| e.to_string())?
@@ -787,18 +825,21 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     }; // Database lock is automatically released here
 
     // Check if query is a pattern (glob or regex)
+    // Prioritize glob detection - if it has * or ? without regex-only chars, treat as glob
     let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']);
-    let is_regex_query = query.contains(['[', ']', '(', ')', '|', '^', '$', '.', '+', '{', '}', '\\']) 
-        || (query.starts_with('/') && query.ends_with('/'));
+    let is_regex_query = !is_glob_pattern && (query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
+        || (query.starts_with('/') && query.ends_with('/')));
     
     let mut results: Vec<(i64, FileEntry)> = if is_glob_pattern {
         // Handle glob pattern search (convert to regex)
         println!("Detected glob pattern: '{}', processing {} files", query, files.len());
         let regex_pattern = glob_to_regex(&query);
         println!("Converted to regex: '{}'", regex_pattern);
+        let total_files = files.len(); // Store length before consuming files
         match Regex::new(&regex_pattern) {
             Ok(regex) => {
                 let mut match_count = 0;
+                let mut java_file_count = 0;
                 let results: Vec<_> = files.into_iter()
                     .filter_map(|(path, name)| {
                         // Check if file is in a library/build directory
@@ -812,10 +853,19 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         let path_component_match = path_components.iter().any(|component| regex.is_match(component));
                         let full_path_match = regex.is_match(&path);
 
-                        // Debug: check for java files specifically
+                        // Debug: check for java files specifically and also show what IS matching
                         if name.to_lowercase().ends_with(".java") {
-                            println!("Found Java file: {} - name_match: {}, path_component_match: {}, full_path_match: {}", 
-                                     name, name_match, path_component_match, full_path_match);
+                            java_file_count += 1;
+                            if java_file_count <= 5 {
+                                println!("Java file #{}: '{}' - Testing regex '{}' - name_match: {}, path_component_match: {}, full_path_match: {}", 
+                                         java_file_count, name, regex_pattern, name_match, path_component_match, full_path_match);
+                            }
+                        }
+                        
+                        // Debug: show first few matches regardless of extension
+                        if (name_match || path_component_match || full_path_match) && match_count < 5 {
+                            println!("MATCH #{}: '{}' (path: {}) - name_match: {}, path_component_match: {}, full_path_match: {}", 
+                                     match_count + 1, name, path, name_match, path_component_match, full_path_match);
                         }
                         
                         if name_match || path_component_match || full_path_match {
@@ -860,7 +910,8 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         }
                     })
                     .collect();
-                println!("Glob pattern '{}' matched {} files", query, match_count);
+                println!("Glob pattern '{}' matched {} files out of {} total files ({} java files checked)", 
+                         query, match_count, total_files, java_file_count);
                 results
             },
             Err(_) => {

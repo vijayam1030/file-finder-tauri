@@ -22,6 +22,13 @@ let searchOptions = {
   filename_only: false
 };
 
+// Sort options
+let currentSort = {
+  search: 'relevance',  // relevance, date, usage
+  recent: 'usage',      // usage, date
+  favorites: 'name'     // name, date, usage
+};
+
 // Initialize app
 window.addEventListener("DOMContentLoaded", async () => {
   searchInput = document.querySelector("#search-input");
@@ -222,6 +229,31 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   });
 
+  // Setup sort tab listeners
+  document.querySelectorAll(".sort-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      const sortType = e.target.dataset.sort;
+      const tabType = e.target.dataset.tab;
+      
+      // Update sort option
+      currentSort[tabType] = sortType;
+      
+      // Update active sort button
+      document.querySelectorAll(`.sort-btn[data-tab="${tabType}"]`).forEach(b => {
+        b.classList.toggle("active", b.dataset.sort === sortType);
+      });
+      
+      // Re-render the current tab with new sort
+      if (tabType === 'search' && activeTab === 'search') {
+        renderSearchResults(currentResults);
+      } else if (tabType === 'recent' && activeTab === 'recent') {
+        loadRecentFiles(); // Reload with new sort
+      } else if (tabType === 'favorites' && activeTab === 'favorites') {
+        loadFavorites(); // Reload with new sort
+      }
+    });
+  });
+
   // Load initial status
   await updateStatus();
   
@@ -237,6 +269,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   setInterval(checkScheduledReindex, 60 * 60 * 1000); // Check every hour
 });
 
+// Update sort button states for the active tab
+function updateSortButtons(tabName) {
+  if (tabName === 'search' || tabName === 'recent' || tabName === 'favorites') {
+    const currentSortType = currentSort[tabName];
+    document.querySelectorAll(`.sort-btn[data-tab="${tabName}"]`).forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.sort === currentSortType);
+    });
+  }
+}
+
 // Switch between tabs
 function switchTab(tabName) {
   // Update active tab
@@ -251,6 +293,9 @@ function switchTab(tabName) {
   document.querySelectorAll(".tab-content").forEach(content => {
     content.classList.toggle("active", content.id === `${tabName}-results`);
   });
+  
+  // Update sort buttons for the active tab
+  updateSortButtons(tabName);
   
   // Load content for the active tab
   if (tabName === 'recent') {
@@ -350,17 +395,84 @@ async function performSearch(query) {
   }
 }
 
+// Sort recent files based on the selected criteria
+function sortRecentFiles(results, sortType) {
+  switch (sortType) {
+    case 'date':
+      // Sort by most recent access time
+      return [...results].sort((a, b) => b.last_accessed - a.last_accessed);
+      
+    case 'usage':
+    default:
+      // Sort by usage count (default behavior from backend)
+      return [...results].sort((a, b) => {
+        if (b.access_count !== a.access_count) {
+          return b.access_count - a.access_count;
+        }
+        return b.last_accessed - a.last_accessed; // Tie-breaker
+      });
+  }
+}
+
 // Load recent files
 async function loadRecentFiles() {
   try {
     const results = await invoke("get_recent_files");
+    const sortedResults = sortRecentFiles(results, currentSort.recent);
+    
     if (activeTab === 'recent') {
-      currentResults = results;
+      currentResults = sortedResults;
       selectedIndex = 0;
     }
-    renderRecentResults(results);
+    renderRecentResults(sortedResults);
   } catch (error) {
     console.error("Failed to load recent files:", error);
+  }
+}
+
+// Sort favorites based on the selected criteria
+async function sortFavorites(results, sortType) {
+  // Get recent files data for usage/date sorting
+  let recentFilesData = [];
+  try {
+    recentFilesData = await invoke("get_recent_files");
+  } catch (error) {
+    console.error("Failed to load recent files for sorting:", error);
+  }
+  
+  const recentFileMap = new Map(recentFilesData.map(f => [f.path, f]));
+  
+  switch (sortType) {
+    case 'name':
+      // Sort alphabetically by name
+      return [...results].sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+      
+    case 'date':
+      // Sort by most recent access time
+      return [...results].sort((a, b) => {
+        const aRecent = recentFileMap.get(a.path);
+        const bRecent = recentFileMap.get(b.path);
+        const aTime = aRecent ? aRecent.last_accessed : 0;
+        const bTime = bRecent ? bRecent.last_accessed : 0;
+        return bTime - aTime; // Most recent first
+      });
+      
+    case 'usage':
+      // Sort by usage frequency
+      return [...results].sort((a, b) => {
+        const aRecent = recentFileMap.get(a.path);
+        const bRecent = recentFileMap.get(b.path);
+        const aCount = aRecent ? aRecent.access_count : 0;
+        const bCount = bRecent ? bRecent.access_count : 0;
+        if (bCount !== aCount) {
+          return bCount - aCount; // Most used first
+        }
+        // Tie-breaker: alphabetical
+        return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      });
+      
+    default:
+      return results;
   }
 }
 
@@ -373,13 +485,49 @@ async function loadFavorites() {
       return { path, name };
     });
     
+    // Sort results based on current sort option
+    const sortedResults = await sortFavorites(results, currentSort.favorites);
+    
     if (activeTab === 'favorites') {
-      currentResults = results;
+      currentResults = sortedResults;
       selectedIndex = 0;
     }
-    renderFavorites(results);
+    renderFavorites(sortedResults);
   } catch (error) {
     console.error("Failed to load favorites:", error);
+  }
+}
+
+// Sort search results based on the selected criteria
+function sortSearchResults(results, sortType, recentFilesData) {
+  const recentFileMap = new Map(recentFilesData.map(f => [f.path, f]));
+  
+  switch (sortType) {
+    case 'date':
+      // Sort by modification date (assuming we can get it from file stats)
+      // For now, we'll use recent access as a proxy for recent modification
+      return [...results].sort((a, b) => {
+        const aRecent = recentFileMap.get(a.path);
+        const bRecent = recentFileMap.get(b.path);
+        const aTime = aRecent ? aRecent.last_accessed : 0;
+        const bTime = bRecent ? bRecent.last_accessed : 0;
+        return bTime - aTime; // Most recent first
+      });
+      
+    case 'usage':
+      // Sort by usage frequency
+      return [...results].sort((a, b) => {
+        const aRecent = recentFileMap.get(a.path);
+        const bRecent = recentFileMap.get(b.path);
+        const aCount = aRecent ? aRecent.access_count : 0;
+        const bCount = bRecent ? bRecent.access_count : 0;
+        return bCount - aCount; // Most used first
+      });
+      
+    case 'relevance':
+    default:
+      // Keep original order (already sorted by relevance from backend)
+      return results;
   }
 }
 
@@ -419,9 +567,10 @@ async function renderSearchResults(results) {
   // Get recent files to check which results are recent
   let recentPaths = new Set();
   let favoritePaths = new Set();
+  let recentFilesData = [];
   try {
-    const recentFiles = await invoke("get_recent_files");
-    recentPaths = new Set(recentFiles.map(f => f.path));
+    recentFilesData = await invoke("get_recent_files");
+    recentPaths = new Set(recentFilesData.map(f => f.path));
     
     const favorites = await invoke("get_favorites");
     favoritePaths = new Set(favorites);
@@ -429,7 +578,10 @@ async function renderSearchResults(results) {
     console.error("Failed to load recent files/favorites for badges:", error);
   }
 
-  const html = results
+  // Sort results based on current sort option
+  const sortedResults = sortSearchResults(results, currentSort.search, recentFilesData);
+
+  const html = sortedResults
     .map((file, index) => {
       const isSelected = index === selectedIndex && activeTab === 'search';
       

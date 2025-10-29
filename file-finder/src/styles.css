@@ -238,6 +238,41 @@ h1 {
   display: block;
 }
 
+/* Sort tabs within each main tab */
+.sort-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 0 8px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  padding: 6px;
+}
+
+.sort-btn {
+  padding: 6px 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.sort-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.sort-btn.active {
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+}
+
 #search-input {
   width: 100%;
   padding: 16px 20px;

@@ -72,12 +72,26 @@
 
       <div class="results-container">
         <div id="search-results" class="tab-content active">
+          <div class="sort-tabs">
+            <button class="sort-btn active" data-sort="relevance" data-tab="search">Relevance</button>
+            <button class="sort-btn" data-sort="date" data-tab="search">Date Modified</button>
+            <button class="sort-btn" data-sort="usage" data-tab="search">Usage</button>
+          </div>
           <div id="results-list"></div>
         </div>
         <div id="favorites-results" class="tab-content">
+          <div class="sort-tabs">
+            <button class="sort-btn active" data-sort="name" data-tab="favorites">Name</button>
+            <button class="sort-btn" data-sort="date" data-tab="favorites">Date Modified</button>
+            <button class="sort-btn" data-sort="usage" data-tab="favorites">Usage</button>
+          </div>
           <div id="favorites-list"></div>
         </div>
         <div id="recent-results" class="tab-content">
+          <div class="sort-tabs">
+            <button class="sort-btn active" data-sort="usage" data-tab="recent">Most Used</button>
+            <button class="sort-btn" data-sort="date" data-tab="recent">Most Recent</button>
+          </div>
           <div id="recent-list"></div>
         </div>
       </div>

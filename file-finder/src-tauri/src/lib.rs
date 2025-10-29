@@ -80,6 +80,8 @@ pub struct AppState {
     db: Mutex<Connection>,
     // Simple cache for recent search results (query -> (timestamp, results))
     search_cache: Mutex<HashMap<String, (Instant, Vec<FileEntry>)>>,
+    // Regex compilation cache for performance (pattern -> compiled regex)
+    regex_cache: Mutex<HashMap<String, Regex>>,
 }
 
 // Fuzzy matching helper function
@@ -433,6 +435,7 @@ impl AppState {
         Ok(AppState {
             db: Mutex::new(conn),
             search_cache: Mutex::new(HashMap::new()),
+            regex_cache: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -706,7 +709,8 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
     // Normalized query (no separators) for matching "finduname" to "find-uname"
     let query_normalized = normalize_for_matching(query_trimmed);
 
-    for (path, name) in files {
+    // Early termination for fuzzy search - only process first 300 files for performance
+    for (path, name) in files.into_iter().take(300) {
         let name_l = name.to_lowercase();
         let path_l = path.to_lowercase();
         let name_normalized = normalize_for_matching(&name);
@@ -973,20 +977,20 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             if let Some(sql_pattern) = &pattern_info.sql_like_pattern {
                 let (query_sql, limit) = match pattern_info.pattern_type {
                     PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
-                        // For *.ext patterns, search by name only with moderate limit
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY length(name), name LIMIT ?2", 5000)
+                        // For *.ext patterns, very restrictive limit for 1.5M files
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY length(name) LIMIT ?2", 500)
                     },
                     PatternType::SimplePrefix => {
-                        // For prefix patterns, prioritize exact matches with higher limit
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name), name LIMIT ?2", 8000)
+                        // For prefix patterns, moderate limit with fast exact matching
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", 1000)
                     },
                     PatternType::LiteralSearch if query.contains(' ') => {
-                        // For multi-word literal searches like "word list", use broader matching
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) OR LOWER(path) LIKE LOWER(?1) ORDER BY length(name), name LIMIT ?2", 4000)
+                        // For multi-word literal searches, very conservative limit
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) ORDER BY length(name) LIMIT ?2", 300)
                     },
                     _ => {
-                        // For other patterns, use conservative limit with relevance ordering
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) OR LOWER(path) LIKE LOWER(?1) ORDER BY length(name), name LIMIT ?2", 3000)
+                        // For other patterns, ultra-conservative limit
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) ORDER BY length(name) LIMIT ?2", 200)
                     }
                 };
                 
@@ -1003,9 +1007,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 vec![]
             }
         } else {
-            // COMPLEX REGEX PATH: Load files for full regex matching
+            // COMPLEX REGEX PATH: Load files for full regex matching - very limited for 1.5M files
             let start_time = Instant::now();
-            let limit = if pattern_info.prefix.is_some() { 15000 } else { 10000 };
+            let limit = if pattern_info.prefix.is_some() { 2000 } else { 1000 };
             
             let mut stmt = db
                 .prepare(&format!("SELECT path, name, modified_at FROM files LIMIT {}", limit))
@@ -1059,6 +1063,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             println!("Processing {} files for simple prefix pattern '{}'", files.len(), prefix);
             
             let mut exact_results: Vec<(i64, FileEntry)> = files.into_iter()
+                .take(200) // Early termination for 1.5M files - stop after 200 good results
                 .map(|(path, name, modified_at)| {
                     let mut score = 5000; // High score for prefix matches
                 
@@ -1081,8 +1086,8 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             .collect();
 
             
-            // Add fuzzy search if we have few exact matches
-            if exact_results.len() < 50 && prefix.len() >= 3 {
+            // Skip expensive fuzzy search fallback for 1.5M files performance
+            if false && exact_results.len() < 50 && prefix.len() >= 3 {
                 println!("Adding fuzzy search for broader coverage");
                 
                 let fuzzy_files: Vec<(String, String, Option<i64>)> = {
@@ -1164,112 +1169,136 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             println!("Processing {} files with regex '{}' for pattern type {:?}", 
                      files.len(), regex_pattern, pattern_info.pattern_type);
             
-            match Regex::new(&regex_pattern) {
-                Ok(re) => {
-                    // Use parallel processing for large file sets (>1000 files)
-                    let matched_files: Vec<(i64, FileEntry)> = if files.len() > 1000 {
-                        files.into_par_iter()
-                            .filter_map(|(path, name, modified_at)| {
-                                if re.is_match(&name) || re.is_match(&path) {
-                                    let mut score = 4000;
-                                    
-                                    if recent.contains(&path) {
-                                        score += 1000;
-                                    }
-                                    if favorites.contains(&path) {
-                                        score += 2000;
-                                    }
-                                    
-                                    Some((score, FileEntry {
-                                        path,
-                                        name,
-                                        last_accessed: None,
-                                        access_count: 0,
-                                        modified_at,
-                                    }))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    } else {
-                        // For smaller sets, sequential processing is faster due to reduced overhead
-                        files.into_iter()
-                            .filter_map(|(path, name, modified_at)| {
-                                if re.is_match(&name) || re.is_match(&path) {
-                                    let mut score = 4000;
-                                    
-                                    if recent.contains(&path) {
-                                        score += 1000;
-                                    }
-                                    if favorites.contains(&path) {
-                                        score += 2000;
-                                    }
-                                    
-                                    Some((score, FileEntry {
-                                        path,
-                                        name,
-                                        last_accessed: None,
-                                        access_count: 0,
-                                        modified_at,
-                                    }))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    };
-                    
-                    println!("Regex matched {} files", matched_files.len());
-                    
-                    // Add fuzzy search fallback for complex patterns with few matches
-                    let mut matched_files = matched_files; // Make mutable for potential extension
-                    if matches!(pattern_info.pattern_type, PatternType::PrefixSuffix | PatternType::ComplexRegex) && matched_files.len() < 20 {
-                        let clean_query = query.replace("^", "").replace(".*", "").replace("$", "").replace(r"\.", ".");
-                        if clean_query.len() >= 3 {
-                            println!("Adding fuzzy search fallback for '{}'", clean_query);
+            // Check regex cache first, then compile if needed
+            let re = {
+                let mut regex_cache = state.regex_cache.lock().map_err(|e| e.to_string())?;
+                
+                // Clean cache if it gets too large (keep only 50 recent patterns)
+                if regex_cache.len() > 50 {
+                    regex_cache.clear();
+                }
+                
+                if let Some(cached_regex) = regex_cache.get(&regex_pattern) {
+                    println!("REGEX CACHE HIT for pattern '{}'", regex_pattern);
+                    cached_regex.clone()
+                } else {
+                    match Regex::new(&regex_pattern) {
+                        Ok(new_regex) => {
+                            regex_cache.insert(regex_pattern.clone(), new_regex.clone());
+                            println!("REGEX COMPILED and cached for pattern '{}'", regex_pattern);
+                            new_regex
+                        }
+                        Err(e) => {
+                            println!("Invalid regex '{}': {}", regex_pattern, e);
+                            let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+                            let fuzzy_results = fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts);
+                            return Ok(fuzzy_results.into_iter().map(|(_, entry)| entry).collect());
+                        }
+                    }
+                }
+            };
+            
+            // Now use the cached/compiled regex
+            // Use parallel processing for large file sets (>1000 files) with early termination
+            let matched_files: Vec<(i64, FileEntry)> = if files.len() > 1000 {
+                files.into_par_iter()
+                    .take(300) // Early termination - only process first 300 files for regex
+                    .filter_map(|(path, name, modified_at)| {
+                        if re.is_match(&name) || re.is_match(&path) {
+                            let mut score = 4000;
                             
-                            let files_2tuple: Vec<(String, String)> = {
-                                let db = state.db.lock().map_err(|e| e.to_string())?;
-                                let mut stmt = db
-                                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
-                                    .map_err(|e| e.to_string())?;
-                                let broad_pattern = format!("%{}%", clean_query);
-                                let results: Vec<(String, String)> = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
-                                    .map_err(|e| e.to_string())?
-                                    .filter_map(|r| r.ok())
-                                    .collect();
-                                results
-                            };
-                            
-                            let fuzzy_results = fuzzy_search_files(files_2tuple, &clean_query, &recent, &favorites, &search_opts);
-                            
-                            for (score, entry) in fuzzy_results {
-                                if !matched_files.iter().any(|(_, existing)| existing.path == entry.path) {
-                                    matched_files.push((score / 2, entry));
-                                }
+                            if recent.contains(&path) {
+                                score += 1000;
+                            }
+                            if favorites.contains(&path) {
+                                score += 2000;
                             }
                             
-                            println!("Added fuzzy matches, total now: {}", matched_files.len());
+                            Some((score, FileEntry {
+                                path,
+                                name,
+                                last_accessed: None,
+                                access_count: 0,
+                                modified_at,
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                // For smaller sets, sequential processing is faster due to reduced overhead
+                files.into_iter()
+                    .take(200) // Early termination for sequential processing too
+                    .filter_map(|(path, name, modified_at)| {
+                        if re.is_match(&name) || re.is_match(&path) {
+                            let mut score = 4000;
+                            
+                            if recent.contains(&path) {
+                                score += 1000;
+                            }
+                            if favorites.contains(&path) {
+                                score += 2000;
+                            }
+                            
+                            Some((score, FileEntry {
+                                path,
+                                name,
+                                last_accessed: None,
+                                access_count: 0,
+                                modified_at,
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            
+            println!("Regex matched {} files", matched_files.len());
+            
+            // Add fuzzy search fallback for complex patterns with few matches
+            let mut matched_files = matched_files; // Make mutable for potential extension
+            if matches!(pattern_info.pattern_type, PatternType::PrefixSuffix | PatternType::ComplexRegex) && matched_files.len() < 20 {
+                let clean_query = query.replace("^", "").replace(".*", "").replace("$", "").replace(r"\.", ".");
+                if clean_query.len() >= 3 {
+                    println!("Adding fuzzy search fallback for '{}'", clean_query);
+                    
+                    let files_2tuple: Vec<(String, String)> = {
+                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                        let mut stmt = db
+                            .prepare("SELECT path, name FROM files WHERE name LIKE ?1 OR path LIKE ?2 LIMIT 2000")
+                            .map_err(|e| e.to_string())?;
+                        let broad_pattern = format!("%{}%", clean_query);
+                        let results: Vec<(String, String)> = stmt.query_map([&broad_pattern, &broad_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                            .map_err(|e| e.to_string())?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        results
+                    };
+                    
+                    let fuzzy_results = fuzzy_search_files(files_2tuple, &clean_query, &recent, &favorites, &search_opts);
+                    
+                    for (score, entry) in fuzzy_results {
+                        if !matched_files.iter().any(|(_, existing)| existing.path == entry.path) {
+                            matched_files.push((score / 2, entry));
                         }
                     }
                     
-                    matched_files
-                }
-                Err(_) => {
-                    println!("Invalid regex '{}', falling back to fuzzy search", regex_pattern);
-                    let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
-                    fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
+                    println!("Added fuzzy matches, total now: {}", matched_files.len());
                 }
             }
+            
+            matched_files
         }
         
         PatternType::LiteralSearch => {
             // For simple text searches, use SQL optimization if available, otherwise fuzzy search
             if pattern_info.can_use_sql_optimization && !files.is_empty() {
                 println!("Using SQL-optimized literal search for pattern '{}' on {} pre-filtered files", query, files.len());
-                // Convert SQL-optimized results to scored FileEntry format
+                // Convert SQL-optimized results to scored FileEntry format with early termination
                 files.into_iter()
+                    .take(150) // Early termination - only process first 150 SQL-optimized results
                     .map(|(path, name, modified_at)| {
                         // Score based on how well the query matches (case-insensitive substring match)
                         let name_lower = name.to_lowercase();
@@ -1332,25 +1361,22 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         }
     };
 
-    // Early termination optimization: if we have many high-quality results, 
-    // we can skip processing the rest for better performance
-    if results.len() > 2000 {
-        // Partial sort to get top candidates quickly
-        results.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        
-        // Check if we have enough high-quality results (score > 6000)
-        let high_quality_count = results.iter().take(1500).filter(|(score, _)| *score > 6000).count();
-        if high_quality_count > 500 {
-            println!("EARLY TERMINATION: Found {} high-quality results, truncating to top 1500", high_quality_count);
-            results.truncate(1500);
-        }
+    // Optimized sorting for 1.5M files - use partial sort for better performance
+    let final_results: Vec<FileEntry> = if results.len() > 1000 {
+        // For large result sets, use partial sort to get only top 500 results
+        let k = 500.min(results.len());
+        results.select_nth_unstable_by(k - 1, |a, b| b.0.cmp(&a.0));
+        results.into_iter().take(k).map(|(_, entry)| entry).collect()
+    } else if results.len() > 100 {
+        // For medium result sets, use partial sort to get top 300
+        let k = 300.min(results.len());
+        results.select_nth_unstable_by(k - 1, |a, b| b.0.cmp(&a.0));
+        results.into_iter().take(k).map(|(_, entry)| entry).collect()
     } else {
-        // Full sort for smaller result sets
-        results.sort_by(|a, b| b.0.cmp(&a.0));
-    }
-
-    // Prepare final results with optimized limit
-    let final_results: Vec<FileEntry> = results.into_iter().take(1000).map(|(_, entry)| entry).collect();
+        // For small result sets, full sort is fine
+        results.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        results.into_iter().take(100).map(|(_, entry)| entry).collect()
+    };
     
     // Cache the results for future queries (limit cache size to 100 entries)
     {

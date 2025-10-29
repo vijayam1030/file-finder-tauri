@@ -177,6 +177,26 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
     
     // Check if it's just literal text (no regex metacharacters)
     if !actual_pattern.chars().any(|c| ".*+?^${}[]()\\|".contains(c)) {
+        // Special handling for multi-word queries
+        if actual_pattern.contains(' ') {
+            // For multi-word queries like "word list", we want to find files that contain
+            // all words, even if they're concatenated (e.g., "grewordlist")
+            let words: Vec<&str> = actual_pattern.split_whitespace().collect();
+            if words.len() == 2 {
+                // For two-word queries, try both "word1 word2" and "word1word2"
+                let concatenated = words.join("");
+                return PatternInfo {
+                    pattern_type: PatternType::LiteralSearch,
+                    prefix: None,
+                    suffix: None,
+                    can_use_sql_optimization: true,
+                    // Use the concatenated version for better matching
+                    sql_like_pattern: Some(format!("%{}%", concatenated)),
+                    regex_pattern: actual_pattern.to_string(),
+                };
+            }
+        }
+        
         return PatternInfo {
             pattern_type: PatternType::LiteralSearch,
             prefix: None,
@@ -960,8 +980,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         // For prefix patterns, prioritize exact matches with higher limit
                         ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 OR path LIKE ?1 ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name), name LIMIT ?2", 8000)
                     },
+                    PatternType::LiteralSearch if query.contains(' ') => {
+                        // For multi-word literal searches like "word list", use broader matching
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) OR LOWER(path) LIKE LOWER(?1) ORDER BY length(name), name LIMIT ?2", 4000)
+                    },
                     _ => {
-                        // For literal search and other patterns, use conservative limit with relevance ordering
+                        // For other patterns, use conservative limit with relevance ordering
                         ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) OR LOWER(path) LIKE LOWER(?1) ORDER BY length(name), name LIMIT ?2", 3000)
                     }
                 };
@@ -1249,7 +1273,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .map(|(path, name, modified_at)| {
                         // Score based on how well the query matches (case-insensitive substring match)
                         let name_lower = name.to_lowercase();
+                        let path_lower = path.to_lowercase();
                         let query_lower = query.to_lowercase();
+                        
                         let mut score = if name_lower.contains(&query_lower) {
                             if name_lower == query_lower {
                                 5000 // Exact match
@@ -1258,11 +1284,24 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                             } else {
                                 3000 // Contains query
                             }
+                        } else if path_lower.contains(&query_lower) {
+                            2000 // Path contains query
                         } else {
-                            // Check path match
-                            let path_lower = path.to_lowercase();
-                            if path_lower.contains(&query_lower) {
-                                2000 // Path contains query
+                            // For multi-word queries, check if all words are present in the filename
+                            let words: Vec<&str> = query_lower.split_whitespace().collect();
+                            if words.len() > 1 {
+                                let all_words_in_name = words.iter().all(|word| name_lower.contains(word));
+                                let all_words_in_path = words.iter().all(|word| path_lower.contains(word));
+                                
+                                if all_words_in_name {
+                                    // All words found in filename - good match for multi-word queries
+                                    2800
+                                } else if all_words_in_path {
+                                    // All words found in path
+                                    1800  
+                                } else {
+                                    1000 // Partial match
+                                }
                             } else {
                                 1000 // SQL matched but we're not sure why
                             }

@@ -422,7 +422,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
     // - Give a strong boost for contiguous (exact substring) matches
     // - Fall back to fuzzy matching only when ordered substring checks fail, and require a reasonable score threshold
     let matcher = SkimMatcherV2::default();
-    let mut results: Vec<(i64, FileEntry)> = Vec::with_capacity(100);
+    let mut results: Vec<(i64, FileEntry)> = Vec::with_capacity(1000);
 
     let query_trimmed = query.trim();
     if query_trimmed.is_empty() {
@@ -998,8 +998,8 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     // Sort by score (descending) and limit early for better performance
     results.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Return top 100 results for faster response
-    Ok(results.into_iter().take(100).map(|(_, entry)| entry).collect())
+    // Return top 1000 results for faster response
+    Ok(results.into_iter().take(1000).map(|(_, entry)| entry).collect())
 }
 
 #[tauri::command]

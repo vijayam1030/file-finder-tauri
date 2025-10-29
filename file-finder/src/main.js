@@ -58,24 +58,84 @@ window.addEventListener("DOMContentLoaded", async () => {
         });
         
         if (selected) {
+          // Start indexing
           indexStatusEl.textContent = `Indexing: ${selected}`;
           indexFolderBtn.disabled = true;
           indexFolderBtn.textContent = "Indexing...";
           
-          await invoke("index_custom_folder", { path: selected });
+          // Get initial file count
+          const initialStatus = await invoke("get_index_status");
+          const initialCount = initialStatus.total_files;
           
-          // Poll for status updates
-          const interval = setInterval(async () => {
-            const status = await invoke("get_index_status");
-            indexStatusEl.textContent = `${status.total_files.toLocaleString()} files indexed`;
-          }, 2000);
-          
-          // Stop polling after 2 minutes
-          setTimeout(() => {
-            clearInterval(interval);
+          // Start the indexing process (non-blocking)
+          invoke("index_custom_folder", { path: selected }).then(() => {
+            console.log("Indexing completed");
+          }).catch((error) => {
+            console.error("Indexing failed:", error);
+            indexStatusEl.textContent = `Indexing failed: ${error}`;
             indexFolderBtn.disabled = false;
             indexFolderBtn.textContent = "Re-index";
-          }, 120000);
+          });
+          
+          // Poll for status updates more frequently
+          let pollCount = 0;
+          let lastCount = initialCount;
+          let stableCount = 0;
+          
+          const interval = setInterval(async () => {
+            try {
+              const status = await invoke("get_index_status");
+              const currentCount = status.total_files;
+              const newFiles = currentCount - initialCount;
+              
+              // Show progress
+              if (newFiles > 0) {
+                indexStatusEl.textContent = `Indexing: ${currentCount.toLocaleString()} files (+${newFiles.toLocaleString()} new)`;
+              } else {
+                indexStatusEl.textContent = `Indexing: ${currentCount.toLocaleString()} files`;
+              }
+              
+              // Check if indexing is complete (file count stabilized)
+              if (currentCount === lastCount) {
+                stableCount++;
+              } else {
+                stableCount = 0;
+                lastCount = currentCount;
+              }
+              
+              // If count has been stable for 3 polls (6 seconds), assume indexing is done
+              if (stableCount >= 3 || pollCount > 60) { // Max 2 minutes
+                clearInterval(interval);
+                indexStatusEl.textContent = `${currentCount.toLocaleString()} files indexed`;
+                indexFolderBtn.disabled = false;
+                indexFolderBtn.textContent = "Re-index";
+                
+                if (newFiles > 0) {
+                  // Show completion message briefly
+                  const tempMessage = indexStatusEl.textContent;
+                  indexStatusEl.textContent = `Indexing complete! Added ${newFiles.toLocaleString()} files`;
+                  setTimeout(() => {
+                    indexStatusEl.textContent = tempMessage;
+                  }, 3000);
+                }
+                
+                // Refresh current search results if there's an active search
+                const currentQuery = searchInput.value.trim();
+                if (currentQuery && activeTab === 'search') {
+                  console.log("Refreshing search results after indexing...");
+                  await performSearch(currentQuery);
+                }
+                
+                // Reload recent files and favorites
+                await loadRecentFiles();
+                await loadFavorites();
+              }
+              
+              pollCount++;
+            } catch (error) {
+              console.error("Failed to get status during indexing:", error);
+            }
+          }, 2000); // Poll every 2 seconds
         }
       } catch (error) {
         console.error("Failed to index folder:", error);
@@ -165,8 +225,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Load initial status
   await updateStatus();
   
-  // Load recent files in the recent tab
+  // Load recent files and favorites
   await loadRecentFiles();
+  await loadFavorites();
 
   // Auto-refresh status (less frequent to avoid development interruptions)
   setInterval(updateStatus, 15000);
@@ -194,6 +255,8 @@ function switchTab(tabName) {
   // Load content for the active tab
   if (tabName === 'recent') {
     loadRecentFiles();
+  } else if (tabName === 'favorites') {
+    loadFavorites();
   } else if (tabName === 'search') {
     // Switch to search tab - if there's a query, perform search
     const query = searchInput.value.trim();
@@ -225,34 +288,65 @@ function handleSearch() {
   searchTimeout = setTimeout(async () => {
     const query = searchInput.value.trim();
     await performSearch(query);
-  }, 50); // Debounce 50ms for faster response
+  }, 150); // Debounce 150ms to reduce flicker
 }
+
+// Track the current search to prevent race conditions
+let currentSearchId = 0;
 
 // Perform search
 async function performSearch(query) {
+  const searchId = ++currentSearchId;
+  
   try {
     if (query) {
-      // Show searching indicator
-      resultsList.innerHTML = `
-        <div class="searching-indicator">
-          <div class="spinner"></div>
-          <p>Searching...</p>
-        </div>
-      `;
+      // Only show searching indicator after a delay to avoid flicker for fast searches
+      const searchingTimeout = setTimeout(() => {
+        // Only show if this search is still current
+        if (searchId === currentSearchId) {
+          resultsList.innerHTML = `
+            <div class="searching-indicator">
+              <div class="spinner"></div>
+              <p>Searching...</p>
+            </div>
+          `;
+        }
+      }, 200); // 200ms delay before showing "Searching..."
       
       const results = await invoke("search_files", { query, options: searchOptions });
-      currentResults = results;
-      selectedIndex = 0;
-      renderSearchResults(results);
+      
+      // Clear the searching timeout since we got results
+      clearTimeout(searchingTimeout);
+      
+      // Debug: Log search info for troubleshooting
+      console.log(`Search for "${query}" returned ${results.length} results`);
+      if (results.length === 0) {
+        console.log("No results found. Search options:", searchOptions);
+        console.log("Running automatic debug check...");
+        // Automatically run debug check for common patterns when no results found
+        setTimeout(() => debugCheckFile(''), 1000);
+      }
+      
+      // Only update if this search is still the current one (prevent race conditions)
+      if (searchId === currentSearchId) {
+        currentResults = results;
+        selectedIndex = 0;
+        renderSearchResults(results);
+      }
     } else {
-      currentResults = [];
-      renderSearchResults([]);
+      // Only update if this is still the current search
+      if (searchId === currentSearchId) {
+        currentResults = [];
+        renderSearchResults([]);
+      }
     }
   } catch (error) {
-    console.error("Search error:", error);
-    showError("Search failed: " + error);
-    // Clear the searching indicator on error
-    renderSearchResults([]);
+    // Only handle error if this is still the current search
+    if (searchId === currentSearchId) {
+      console.error("Search error:", error);
+      showError("Search failed: " + error);
+      renderSearchResults([]);
+    }
   }
 }
 
@@ -270,14 +364,44 @@ async function loadRecentFiles() {
   }
 }
 
+async function loadFavorites() {
+  try {
+    const favorites = await invoke("get_favorites");
+    // Convert favorite paths to file objects with names
+    const results = favorites.map(path => {
+      const name = path.split(/[/\\]/).pop();
+      return { path, name };
+    });
+    
+    if (activeTab === 'favorites') {
+      currentResults = results;
+      selectedIndex = 0;
+    }
+    renderFavorites(results);
+  } catch (error) {
+    console.error("Failed to load favorites:", error);
+  }
+}
+
 // Render search results
 async function renderSearchResults(results) {
   if (results.length === 0) {
     if (searchInput.value.trim()) {
+      const query = searchInput.value.trim();
+      const fileCount = await getIndexedFileCount();
       resultsList.innerHTML = `
         <div class="empty-state">
-          <h3>No files found</h3>
-          <p>Try a different search term, glob pattern (*.js), or regex pattern</p>
+          <h3>No files found for "${escapeHtml(query)}"</h3>
+          <p>Troubleshooting tips:</p>
+          <ul style="text-align: left; margin: 10px 0;">
+            <li>Try a broader search term (e.g., just the filename without extension)</li>
+            <li>Use glob patterns: <code>*.java</code>, <code>*${escapeHtml(query)}*</code></li>
+            <li>Check if the file's directory was indexed (C:\ index might have skipped some paths)</li>
+            <li>Press <kbd>F5</kbd> or <kbd>Ctrl+R</kbd> to refresh the search</li>
+            <li>Try re-indexing the specific folder containing your file</li>
+            <li>Press <kbd>Ctrl+Shift+D</kbd> for debug info (check browser console)</li>
+          </ul>
+          <p><small>Searched ${fileCount} indexed files</small></p>
         </div>
       `;
     } else {
@@ -285,6 +409,7 @@ async function renderSearchResults(results) {
         <div class="empty-state">
           <h3>Enter a search term</h3>
           <p>Search for files and folders, supports glob (*.js) and regex patterns</p>
+          <p><kbd>F5</kbd> or <kbd>Ctrl+R</kbd> to refresh • Click Re-index to add new files</p>
         </div>
       `;
     }
@@ -396,6 +521,9 @@ async function renderSearchResults(results) {
           // Remove FAV badge
           favBadge.remove();
         }
+        
+        // Refresh favorites tab if needed
+        await loadFavorites();
       } catch (error) {
         console.error("Failed to toggle favorite:", error);
       }
@@ -479,6 +607,89 @@ function renderRecentResults(results) {
   }
 }
 
+function renderFavorites(results) {
+  const favoritesList = document.getElementById("favorites-list");
+  if (!favoritesList) return;
+
+  if (results.length === 0) {
+    favoritesList.innerHTML = `
+      <div class="empty-state">
+        <h3>No favorite files</h3>
+        <p>Star files in search results to see them here</p>
+      </div>
+    `;
+    return;
+  }
+
+  const html = results
+    .map((file, index) => {
+      const isSelected = index === selectedIndex && activeTab === 'favorites';
+      const ext = file.name.includes('.') ? file.name.split('.').pop().toUpperCase() : 'FILE';
+      
+      // Determine if it's a folder by checking if the name has no extension and path exists
+      const isFolder = !file.name.includes('.') || file.path.endsWith('/') || file.path.endsWith('\\');
+      const badge = isFolder ? 'FOLDER' : ext;
+
+      return `
+        <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
+          <div class="file-info-row">
+            <div class="file-name">${escapeHtml(file.name)}</div>
+            <span class="file-ext-badge ${isFolder ? 'folder-badge' : ''}">${badge}</span>
+            <button class="favorite-btn favorited" data-path="${escapeHtml(file.path)}" title="Remove from favorites">
+              ★
+            </button>
+            <button class="open-with-btn" data-path="${escapeHtml(file.path)}" title="Open with...">⚙</button>
+          </div>
+          <div class="file-path">${escapeHtml(file.path)}</div>
+          <div class="file-meta"><span class="fav-badge">FAV</span></div>
+        </div>
+      `;
+    })
+    .join("");
+
+  favoritesList.innerHTML = html;
+
+  // Add click listeners for file items
+  favoritesList.querySelectorAll(".file-item").forEach((item) => {
+    item.addEventListener("click", (e) => {
+      if (e.target.classList.contains('open-with-btn') || e.target.classList.contains('favorite-btn')) {
+        return;
+      }
+      const path = item.dataset.path;
+      openFile(path);
+    });
+  });
+
+  // Add click listeners for favorite buttons
+  favoritesList.querySelectorAll(".favorite-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      try {
+        await invoke("toggle_favorite", { path });
+        // Reload favorites after removing
+        await loadFavorites();
+      } catch (error) {
+        console.error("Failed to toggle favorite:", error);
+      }
+    });
+  });
+
+  // Add click listeners for "Open with" buttons
+  favoritesList.querySelectorAll(".open-with-btn").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = btn.dataset.path;
+      await showOpenWithDialog(path);
+    });
+  });
+
+  // Scroll selected item into view
+  if (activeTab === 'favorites') {
+    scrollToSelected();
+  }
+}
+
 // Handle keyboard navigation
 function handleKeyboard(e) {
   // Don't handle vim keys if user is typing in the search input (except for special keys)
@@ -486,6 +697,25 @@ function handleKeyboard(e) {
   const isNavigationKey = ['ArrowDown', 'ArrowUp', 'Enter', 'Escape'].includes(e.key);
   const isVimKey = ['j', 'k', 'g', 'G'].includes(e.key);
   const isCtrlKey = e.ctrlKey && ['d', 'u'].includes(e.key);
+  
+  // Handle refresh shortcuts before other checks
+  if (e.key === 'F5' || (e.ctrlKey && e.key === 'r')) {
+    e.preventDefault();
+    const currentQuery = searchInput.value.trim();
+    if (currentQuery) {
+      console.log("Force refreshing search for:", currentQuery);
+      performSearch(currentQuery);
+    }
+    return;
+  }
+  
+  // Debug shortcut - Ctrl+Shift+D
+  if (e.ctrlKey && e.shiftKey && e.key === 'D') {
+    e.preventDefault();
+    console.log("Running debug check for KotlinConventions.java...");
+    debugCheckFile('C:\\charry\\java\\source\\spring-boot\\buildSrc\\src\\main\\java\\org\\springframework\\boot\\build\\KotlinConventions.java');
+    return;
+  }
   
   // Allow navigation keys and Escape even when typing
   // Only block vim keys when actively typing (not for Ctrl combinations)
@@ -575,6 +805,8 @@ function handleKeyboard(e) {
 function renderCurrentTab() {
   if (activeTab === 'search') {
     renderSearchResults(currentResults);
+  } else if (activeTab === 'favorites') {
+    renderFavorites(currentResults);
   } else {
     renderRecentResults(currentResults);
   }
@@ -732,6 +964,12 @@ async function updateStatus() {
       return;
     }
 
+    // Don't update status if we're currently indexing (button is disabled)
+    const indexFolderBtn = document.querySelector("#index-folder-btn");
+    if (indexFolderBtn && indexFolderBtn.disabled) {
+      return; // Skip status update while indexing is in progress
+    }
+
     if (status.total_files === 0) {
       indexStatusEl.textContent = "No files indexed yet";
     } else {
@@ -841,4 +1079,147 @@ function escapeHtml(text) {
   const div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
+}
+
+async function getIndexedFileCount() {
+  try {
+    const status = await invoke("get_index_status");
+    return status.total_files.toLocaleString();
+  } catch (error) {
+    return "unknown";
+  }
+}
+
+// Debug function to check if a specific file exists in database
+async function debugCheckFile(filePath) {
+  try {
+    console.log("=== DEBUG: Testing search patterns ===");
+    
+    // Test various search patterns that should find KotlinConventions.java
+    const patterns = [
+      // Exact matches
+      'KotlinConventions.java',
+      'KotlinConventions',
+      
+      // Partial matches
+      'Kotlin',
+      'kotlin',
+      'Conventions',
+      'conventions',
+      
+      // Glob patterns
+      'kotlin*',
+      'Kotlin*',
+      '*Conventions*',
+      '*conventions*',
+      '*.java',
+      
+      // Path components
+      'spring-boot',
+      'buildSrc',
+      'charry',
+      
+      // Very broad
+      'java',
+      'org'
+    ];
+    
+    for (const pattern of patterns) {
+      try {
+        const results = await invoke("search_files", { query: pattern, options: searchOptions });
+        console.log(`📋 Pattern "${pattern}": ${results.length} results`);
+        
+        // Check if our specific file is in the results
+        const targetFile = results.find(r => 
+          r.path.toLowerCase().includes('kotlinconventions.java') ||
+          r.name.toLowerCase().includes('kotlinconventions.java')
+        );
+        
+        if (targetFile) {
+          console.log(`✅ FOUND target file with pattern "${pattern}":`, targetFile);
+          return targetFile;
+        }
+        
+        // Also check for any files in the charry directory
+        const charryFiles = results.filter(r => r.path.toLowerCase().includes('charry'));
+        if (charryFiles.length > 0) {
+          console.log(`📁 Found ${charryFiles.length} files in charry directory with pattern "${pattern}"`);
+          if (charryFiles.length <= 5) {
+            charryFiles.forEach(f => console.log(`   - ${f.name}: ${f.path}`));
+          }
+        }
+        
+        // Special check for buildSrc directory contents
+        if (pattern === 'buildSrc') {
+          const buildSrcFiles = results.filter(r => r.path.toLowerCase().includes('buildsrc'));
+          console.log(`🔧 BuildSrc directory analysis:`);
+          buildSrcFiles.forEach(f => {
+            console.log(`   📂 ${f.name}: ${f.path}`);
+          });
+          
+          // Try to find any files specifically in the buildSrc/src path
+          console.log(`🔍 Searching for files in buildSrc/src path...`);
+          try {
+            const buildSrcSrcResults = await invoke("search_files", { 
+              query: "buildSrc/src", 
+              options: searchOptions 
+            });
+            console.log(`📋 "buildSrc/src" pattern: ${buildSrcSrcResults.length} results`);
+            buildSrcSrcResults.slice(0, 10).forEach(f => {
+              console.log(`   📄 ${f.name}: ${f.path}`);
+            });
+          } catch (e) {
+            console.log(`❌ Error searching buildSrc/src:`, e);
+          }
+        }
+        
+        // Check for any java files
+        if (pattern === '*.java' && results.length > 0) {
+          console.log(`☕ Sample Java files found:`, results.slice(0, 3).map(f => f.name));
+        }
+        
+      } catch (error) {
+        console.error(`❌ Error with pattern "${pattern}":`, error);
+      }
+    }
+    
+    // Final specific check - look for files in the exact path structure
+    console.log("🎯 FINAL CHECK: Looking for files in buildSrc/src/main/java path...");
+    try {
+      const pathPatterns = [
+        "buildSrc/src/main",
+        "src/main/java",
+        "main/java/org",
+        "java/org/springframework",
+        "org/springframework/boot",
+        "springframework/boot/build",
+        "boot/build"
+      ];
+      
+      for (const pathPattern of pathPatterns) {
+        const pathResults = await invoke("search_files", { 
+          query: pathPattern, 
+          options: searchOptions 
+        });
+        console.log(`📍 Path "${pathPattern}": ${pathResults.length} results`);
+        
+        if (pathResults.length > 0 && pathResults.length <= 10) {
+          pathResults.forEach(f => {
+            console.log(`   📄 ${f.name}: ${f.path}`);
+          });
+        }
+      }
+    } catch (e) {
+      console.log(`❌ Error in final path check:`, e);
+    }
+    
+    console.log("=== END DEBUG ===");
+    console.log("💡 Analysis complete. The file likely exists but wasn't indexed due to:")
+    console.log("   - Deep directory nesting (buildSrc/src/main/java/org/springframework/boot/build/)")
+    console.log("   - Possible indexing limits or exclusions")
+    console.log("   - Try re-indexing C:\\charry\\java\\source\\spring-boot\\buildSrc specifically");
+    
+  } catch (error) {
+    console.error('❌ Debug check failed:', error);
+  }
 }

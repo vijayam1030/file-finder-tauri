@@ -9,6 +9,8 @@ use walkdir::WalkDir;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
+
+mod llm_integration;
 use regex::Regex;
 use std::collections::{HashSet, HashMap};
 use rayon::prelude::*;
@@ -82,6 +84,8 @@ pub struct AppState {
     search_cache: Mutex<HashMap<String, (Instant, Vec<FileEntry>)>>,
     // Regex compilation cache for performance (pattern -> compiled regex)
     regex_cache: Mutex<HashMap<String, Regex>>,
+    // LLM processor for natural language queries
+    llm_processor: llm_integration::LLMProcessor,
 }
 
 // Fuzzy matching helper function
@@ -436,6 +440,7 @@ impl AppState {
             db: Mutex::new(conn),
             search_cache: Mutex::new(HashMap::new()),
             regex_cache: Mutex::new(HashMap::new()),
+            llm_processor: llm_integration::LLMProcessor::new(),
         })
     }
 }
@@ -945,8 +950,44 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         return Ok(vec![]);
     }
 
+    // NEW: LLM-Enhanced Query Processing
+    // Check if query looks natural language vs technical
+    let is_natural_language = query.contains(" ") && 
+                             (query.to_lowercase().contains("find") || 
+                              query.to_lowercase().contains("show") ||
+                              query.to_lowercase().contains("where") ||
+                              query.to_lowercase().contains("recent") ||
+                              query.to_lowercase().contains("python") ||
+                              query.to_lowercase().contains("react") ||
+                              query.to_lowercase().contains("config"));
+    
+    let enhanced_query = if is_natural_language {
+        match state.llm_processor.parse_natural_query(&query).await {
+            Ok(parsed) => {
+                println!("LLM PARSED QUERY: {:?}", parsed);
+                if parsed.confidence > 0.7 {
+                    state.llm_processor.convert_to_search_query(&parsed)
+                } else {
+                    query.clone()
+                }
+            }
+            Err(e) => {
+                println!("LLM parsing failed: {}", e);
+                query.clone()
+            }
+        }
+    } else {
+        query.clone()
+    };
+
+    // Special handling for time-based queries (like "find me all the latest files")
+    if enhanced_query.trim().is_empty() && is_natural_language {
+        println!("Detected time-based query, returning recent files");
+        return get_recent_files(state).await;
+    }
+
     // Check cache first (for exact queries, cache for 30 seconds)
-    let cache_key = format!("{}:{:?}", query, search_opts);
+    let cache_key = format!("{}:{:?}", enhanced_query, search_opts);
     {
         let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
         
@@ -966,8 +1007,8 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         let db = state.db.lock().map_err(|e| e.to_string())?;
 
         // Intelligent pattern analysis and optimization
-        let pattern_info = analyze_regex_pattern(&query);
-        println!("PATTERN ANALYSIS: {:?}", pattern_info);
+        let pattern_info = analyze_regex_pattern(&enhanced_query);
+        println!("PATTERN ANALYSIS for '{}': {:?}", enhanced_query, pattern_info);
         
         // SEARCH FILES - use optimized strategy based on pattern analysis
         let files: Vec<(String, String, Option<i64>)> = if pattern_info.can_use_sql_optimization {
@@ -1463,6 +1504,26 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
 }
 
 #[tauri::command]
+async fn natural_language_search(query: String, state: State<'_, AppState>) -> Result<llm_integration::NaturalQuery, String> {
+    if query.trim().is_empty() {
+        return Err("Query cannot be empty".to_string());
+    }
+
+    println!("Processing natural language query: '{}'", query);
+    
+    match state.llm_processor.parse_natural_query(&query).await {
+        Ok(parsed) => {
+            println!("Successfully parsed query: {:?}", parsed);
+            Ok(parsed)
+        }
+        Err(e) => {
+            println!("Failed to parse query: {}", e);
+            Err(format!("Failed to parse natural language query: {}", e))
+        }
+    }
+}
+
+#[tauri::command]
 async fn get_recent_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
@@ -1780,6 +1841,7 @@ pub fn run() {
             start_indexing,
             index_custom_folder,
             search_files,
+            natural_language_search,
             get_recent_files,
             open_file,
             open_file_with,

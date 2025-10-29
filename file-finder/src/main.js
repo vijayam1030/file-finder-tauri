@@ -504,14 +504,15 @@ function sortSearchResults(results, sortType, recentFilesData) {
   
   switch (sortType) {
     case 'date':
-      // Sort by modification date (assuming we can get it from file stats)
-      // For now, we'll use recent access as a proxy for recent modification
+      // NOTE: This sorts by last accessed time, not actual file modification date
+      // The backend doesn't currently store file modification timestamps
+      // TODO: Add file modification time to database schema and FileEntry struct
       return [...results].sort((a, b) => {
         const aRecent = recentFileMap.get(a.path);
         const bRecent = recentFileMap.get(b.path);
         const aTime = aRecent ? aRecent.last_accessed : 0;
         const bTime = bRecent ? bRecent.last_accessed : 0;
-        return bTime - aTime; // Most recent first
+        return bTime - aTime; // Most recently accessed first
       });
       
     case 'usage':

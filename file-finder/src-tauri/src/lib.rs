@@ -72,6 +72,7 @@ pub struct FileEntry {
     pub name: String,
     pub last_accessed: Option<i64>,
     pub access_count: i32,
+    pub modified_at: Option<i64>,
 }
 
 pub struct AppState {
@@ -99,10 +100,17 @@ impl AppState {
                 path TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
                 root_directory TEXT NOT NULL,
-                indexed_at INTEGER NOT NULL
+                indexed_at INTEGER NOT NULL,
+                modified_at INTEGER
             )",
             [],
         )?;
+
+        // Add modified_at column to existing files table if it doesn't exist
+        let _ = conn.execute(
+            "ALTER TABLE files ADD COLUMN modified_at INTEGER",
+            [],
+        ); // Ignore error if column already exists
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS indexed_directories (
@@ -323,7 +331,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
     }
     
     // Collect all entries first (this is I/O bound and relatively fast)
-    let entries: Vec<(String, String)> = WalkDir::new(path)
+    let entries: Vec<(String, String, Option<i64>)> = WalkDir::new(path)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
@@ -345,8 +353,15 @@ async fn index_directory(path: &Path, clear_existing: bool) {
                 }
                 
                 if let Some(name) = entry.file_name().to_str() {
+                    // Get file modification time
+                    let modified_at = entry.metadata()
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs() as i64);
+                    
                     seen_paths.insert(path_str.to_string());
-                    return Some((path_str.to_string(), name.to_string()));
+                    return Some((path_str.to_string(), name.to_string(), modified_at));
                 }
             }
             None
@@ -373,7 +388,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
 
     // Use prepared statement for better performance
     // INSERT OR IGNORE handles any edge case duplicates at DB level (extra safety)
-    let mut stmt = match tx.prepare("INSERT OR IGNORE INTO files (path, name, root_directory, indexed_at) VALUES (?1, ?2, ?3, ?4)") {
+    let mut stmt = match tx.prepare("INSERT OR IGNORE INTO files (path, name, root_directory, indexed_at, modified_at) VALUES (?1, ?2, ?3, ?4, ?5)") {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to prepare statement: {}", e);
@@ -383,8 +398,8 @@ async fn index_directory(path: &Path, clear_existing: bool) {
 
     // Insert all entries
     let mut inserted_count = 0;
-    for (idx, (path_str, name)) in entries.iter().enumerate() {
-        if let Ok(rows_changed) = stmt.execute(params![path_str, name, &root_dir_str, now]) {
+    for (idx, (path_str, name, modified_at)) in entries.iter().enumerate() {
+        if let Ok(rows_changed) = stmt.execute(params![path_str, name, &root_dir_str, now, modified_at]) {
             if rows_changed > 0 {
                 inserted_count += 1;
             }
@@ -561,7 +576,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
             // Boost for recent and favorite files
             if recent.contains(&path) { best_score *= 2; }
             if favorites.contains(&path) { best_score *= 3; } // Favorites get 3x boost
-            results.push((best_score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+            results.push((best_score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0, modified_at: None }));
             continue;
         }
 
@@ -578,7 +593,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                 }
                 if recent.contains(&path) { score *= 2; }
                 if favorites.contains(&path) { score *= 3; }
-                results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0, modified_at: None }));
                 continue;
             }
         }
@@ -597,7 +612,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                     }
                     if recent.contains(&path) { score *= 2; }
                     if favorites.contains(&path) { score *= 3; }
-                    results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                    results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0, modified_at: None }));
                     continue;
                 }
             }
@@ -613,7 +628,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
                         }
                         if recent.contains(&path) { score *= 2; }
                         if favorites.contains(&path) { score *= 3; }
-                        results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0 }));
+                        results.push((score, FileEntry { path: path.clone(), name, last_accessed: None, access_count: 0, modified_at: None }));
                     }
                 }
             }
@@ -679,16 +694,16 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             || query.starts_with('/') && query.ends_with('/');
         
         // SEARCH ALL FILES - no directory filtering
-        let files: Vec<(String, String)> = if needs_all_files {
+        let files: Vec<(String, String, Option<i64>)> = if needs_all_files {
             // For pattern searches, try to optimize with database queries when possible
             if query.starts_with("*.") && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) {
                 // Simple extension glob like "*.java" - use database LIKE query
                 let extension = &query[2..]; // Remove "*."
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 LIMIT 10000")
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
                     .map_err(|e| e.to_string())?;
                 let like_pattern = format!("%.{}", extension);
-                let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -698,10 +713,10 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 // Patterns like "Event*.java" - use optimized SQL query
                 let prefix = query.replace("*", "").replace(".java", "");
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files WHERE name LIKE ?1 AND name LIKE '%.java' LIMIT 10000")
+                    .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND name LIKE '%.java' LIMIT 10000")
                     .map_err(|e| e.to_string())?;
                 let like_pattern = format!("{}%", prefix);
-                let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -712,10 +727,10 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let prefix = query.replace("*", "");
                 if !prefix.is_empty() {
                     let mut stmt = db
-                        .prepare("SELECT path, name FROM files WHERE name LIKE ?1 LIMIT 10000")
+                        .prepare("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 LIMIT 10000")
                         .map_err(|e| e.to_string())?;
                     let like_pattern = format!("{}%", prefix);
-                    let results: Vec<(String, String)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&like_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                         .map_err(|e| e.to_string())?
                         .filter_map(|r| r.ok())
                         .collect();
@@ -724,9 +739,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 } else {
                     // Fallback for complex patterns - limit to reasonable number
                     let mut stmt = db
-                        .prepare("SELECT path, name FROM files LIMIT 50000")
+                        .prepare("SELECT path, name, modified_at FROM files LIMIT 50000")
                         .map_err(|e| e.to_string())?;
-                    let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                         .map_err(|e| e.to_string())?
                         .filter_map(|r| r.ok())
                         .collect();
@@ -735,9 +750,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             } else {
                 // Complex patterns - limit to reasonable number
                 let mut stmt = db
-                    .prepare("SELECT path, name FROM files LIMIT 50000")
+                    .prepare("SELECT path, name, modified_at FROM files LIMIT 50000")
                     .map_err(|e| e.to_string())?;
-                let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -750,7 +765,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             
             if words.len() > 1 {
                 // Multi-word query: check if ALL words appear in name/path (in any order)
-                let mut combined_query = String::from("SELECT path, name FROM files WHERE ");
+                let mut combined_query = String::from("SELECT path, name, modified_at FROM files WHERE ");
                 for (i, word) in words.iter().enumerate() {
                     if i > 0 {
                         combined_query.push_str(" AND ");
@@ -761,7 +776,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 combined_query.push_str(" LIMIT 2000");
                 
                 let mut stmt = db.prepare(&combined_query).map_err(|e| e.to_string())?;
-                let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -771,15 +786,15 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let query_lower = query.to_lowercase();
                 let mut stmt = db
                     .prepare("
-                        SELECT path, name FROM files WHERE LOWER(name) = ?1
+                        SELECT path, name, modified_at FROM files WHERE LOWER(name) = ?1
                         UNION ALL
-                        SELECT path, name FROM files WHERE LOWER(name) LIKE ?2 AND LOWER(name) != ?1
+                        SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE ?2 AND LOWER(name) != ?1
                         LIMIT 1000
                     ")
                     .map_err(|e| e.to_string())?;
                 
                 let like_query = format!("%{}%", query_lower);
-                let results: Vec<(String, String)> = stmt.query_map([&query_lower, &like_query], |row| Ok((row.get(0)?, row.get(1)?)))
+                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([&query_lower, &like_query], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -788,10 +803,10 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         } else {
             // For single character queries, just limit heavily
             let mut stmt = db
-                .prepare("SELECT path, name FROM files LIMIT 500")
+                .prepare("SELECT path, name, modified_at FROM files LIMIT 500")
                 .map_err(|e| e.to_string())?;
             
-            let results: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            let results: Vec<(String, String, Option<i64>)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .map_err(|e| e.to_string())?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -840,7 +855,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let mut match_count = 0;
                 let mut java_file_count = 0;
                 let results: Vec<_> = files.into_iter()
-                    .filter_map(|(path, name)| {
+                    .filter_map(|(path, name, modified_at)| {
                         // Check if file is in a library/build directory
                         let is_in_library_dir = is_library_file(&path);
 
@@ -902,6 +917,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                                     name,
                                     last_accessed: None,
                                     access_count: 0,
+                                    modified_at,
                                 },
                             ))
                         } else {
@@ -914,8 +930,10 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 results
             },
             Err(_) => {
-                // If glob-to-regex conversion fails, fall back to new search
-                fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
+                // If glob-to-regex conversion fails, fall back to fuzzy search
+                // But first we need to convert the 3-tuple format to 2-tuple format for the fuzzy search
+                let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+                fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
             }
         }
     } else if is_regex_query {
@@ -930,7 +948,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         match Regex::new(regex_pattern) {
             Ok(regex) => {
                 files.into_iter()
-                    .filter_map(|(path, name)| {
+                    .filter_map(|(path, name, modified_at)| {
                         // Check if file is in a library/build directory
                         let is_in_library_dir = is_library_file(&path);
 
@@ -976,6 +994,7 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                                     name,
                                     last_accessed: None,
                                     access_count: 0,
+                                    modified_at,
                                 },
                             ))
                         } else {
@@ -985,13 +1004,16 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                     .collect()
             },
             Err(_) => {
-                // If regex is invalid, fall back to new search
-                fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
+                // If regex is invalid, fall back to fuzzy search
+                // Convert 3-tuple format to 2-tuple format for the fuzzy search
+                let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+                fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
             }
         }
     } else {
-        // Handle improved search
-        fuzzy_search_files(files, &query, &recent, &favorites, &search_opts)
+        // Handle improved search - convert 3-tuple to 2-tuple for fuzzy search
+        let files_2tuple: Vec<(String, String)> = files.into_iter().map(|(path, name, _)| (path, name)).collect();
+        fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts)
     };
 
     // Sort by score (descending) and limit early for better performance
@@ -1006,7 +1028,10 @@ async fn get_recent_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, 
     let db = state.db.lock().map_err(|e| e.to_string())?;
 
     let mut stmt = db
-        .prepare("SELECT path, name, last_accessed, access_count FROM recent_files ORDER BY access_count DESC, last_accessed DESC LIMIT 20")
+        .prepare("SELECT rf.path, rf.name, rf.last_accessed, rf.access_count, f.modified_at 
+                  FROM recent_files rf 
+                  LEFT JOIN files f ON rf.path = f.path 
+                  ORDER BY rf.access_count DESC, rf.last_accessed DESC LIMIT 20")
         .map_err(|e| e.to_string())?;
 
     let files: Vec<FileEntry> = stmt
@@ -1016,6 +1041,7 @@ async fn get_recent_files(state: State<'_, AppState>) -> Result<Vec<FileEntry>, 
                 name: row.get(1)?,
                 last_accessed: Some(row.get(2)?),
                 access_count: row.get(3)?,
+                modified_at: row.get(4)?,
             })
         })
         .map_err(|e| e.to_string())?

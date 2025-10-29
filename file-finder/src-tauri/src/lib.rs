@@ -725,9 +725,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
              !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
 
-        // Check for optimizable prefix + suffix patterns like "^multi.*java"
-        let is_prefix_suffix_pattern = query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
-            !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']);
+        // Check for optimizable prefix + suffix patterns like "^multi.*java" or "log.*py"
+        let is_prefix_suffix_pattern = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
+            !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\'])) ||
+            // Also support patterns without ^ like "log.*py"
+            (!query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") && !query.starts_with("*.") &&
+             !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']));
         
         // Additional debugging for prefix+suffix pattern detection
         if query.starts_with('^') && query.contains(".*") {
@@ -776,9 +779,10 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 vec![]
             }
         } else if is_prefix_suffix_pattern {
-            // OPTIMIZED PATH: Patterns like "^multi.*java" - use SQL prefix filtering + regex matching
+            // OPTIMIZED PATH: Patterns like "^multi.*java" or "log.*py" - use SQL prefix filtering + regex matching
             println!("ENTERING PREFIX+SUFFIX PATH for query: '{}'", query);
-            let parts: Vec<&str> = query[1..].split(".*").collect(); // Remove ^ and split on .*
+            let query_without_caret = if query.starts_with('^') { &query[1..] } else { &query };
+            let parts: Vec<&str> = query_without_caret.split(".*").collect();
             println!("SPLIT DEBUG: parts={:?}", parts);
             if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
                 let prefix = parts[0];
@@ -976,8 +980,11 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
          !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
 
-    let is_prefix_suffix_result = query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
-        !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\']);
+    let is_prefix_suffix_result = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
+        !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\'])) ||
+        // Also support patterns without ^ like "log.*py"
+        (!query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") && !query.starts_with("*.") &&
+         !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']));
     
     let is_glob_pattern = query.contains(['*', '?']) && !query.contains(['[', ']', '(', ')', '|', '^', '$', '+', '{', '}']) && 
         !is_simple_prefix_result && !is_prefix_suffix_result;
@@ -1079,8 +1086,14 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         exact_results
     } else if is_prefix_suffix_result {
         // OPTIMIZED PREFIX+SUFFIX: Pre-filtered files, apply regex for exact matching
-        println!("PREFIX+SUFFIX: Processing {} pre-filtered files with regex '{}'", files.len(), query);
-        match Regex::new(&query) {
+        // For patterns without ^, we need to anchor them to match the whole filename
+        let regex_pattern = if query.starts_with('^') {
+            query.to_string()
+        } else {
+            format!("^{}$", query) // Add anchors for patterns like "log.*py"
+        };
+        println!("PREFIX+SUFFIX: Processing {} pre-filtered files with regex '{}' (original: '{}')", files.len(), regex_pattern, query);
+        match Regex::new(&regex_pattern) {
             Ok(regex) => {
                 let mut match_count = 0;
                 let results: Vec<_> = files.into_iter()

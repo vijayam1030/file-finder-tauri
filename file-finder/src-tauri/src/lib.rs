@@ -721,9 +721,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         // Check for simple prefix patterns that can be optimized with pure SQL
         let is_simple_prefix = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
             && query.matches('*').count() == 1) ||
-            // Also detect regex patterns that are actually simple prefixes like "^multi.*" (but not "^multi.*java")
+            // Also detect regex patterns that are actually simple prefixes like "^multi.*" or "logge.*"
             (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
-             !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
+             !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*'])) ||
+            // Also detect patterns like "logge.*" (without ^)
+            (!query.starts_with('^') && query.ends_with(".*") && query.len() > 3 &&
+             !query[..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\', '*']));
 
         // Check for optimizable prefix + suffix patterns like "^multi.*java" or "log.*py"
         let is_prefix_suffix_pattern = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
@@ -755,6 +758,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             let prefix = if query.starts_with('^') && query.ends_with(".*") {
                 // Handle "^multi.*" format - extract "multi"
                 &query[1..query.len()-2]
+            } else if query.ends_with(".*") && !query.starts_with('^') {
+                // Handle "logge.*" format - extract "logge"
+                &query[..query.len()-2]
             } else if query.ends_with('*') {
                 // Handle "multi*" format - extract "multi"
                 &query[..query.len()-1]
@@ -976,9 +982,12 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     // Use the same pattern detection logic as used for file loading
     let is_simple_prefix_result = (query.ends_with('*') && !query.contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\']) 
         && query.matches('*').count() == 1) ||
-        // Also detect regex patterns that are actually simple prefixes like "^multi.*" (but not "^multi.*java")
+        // Also detect regex patterns that are actually simple prefixes like "^multi.*" or "logge.*"
         (query.starts_with('^') && query.ends_with(".*") && query.len() > 4 &&
-         !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*']));
+         !query[1..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '$', '+', '{', '}', '\\', '*'])) ||
+        // Also detect patterns like "logge.*" (without ^)
+        (!query.starts_with('^') && query.ends_with(".*") && query.len() > 3 &&
+         !query[..query.len()-2].contains(['?', '[', ']', '(', ')', '|', '^', '$', '+', '{', '}', '\\', '*']));
 
     let is_prefix_suffix_result = (query.starts_with('^') && query.contains(".*") && !query.ends_with(".*") &&
         !query.contains(['?', '[', ']', '(', ')', '|', '+', '{', '}', '\\'])) ||

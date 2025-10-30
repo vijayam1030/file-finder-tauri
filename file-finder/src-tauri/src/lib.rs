@@ -961,29 +961,37 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                               query.to_lowercase().contains("react") ||
                               query.to_lowercase().contains("config"));
     
-    let enhanced_query = if is_natural_language {
+    let (enhanced_query, parsed_query) = if is_natural_language {
         match state.llm_processor.parse_natural_query(&query).await {
             Ok(parsed) => {
                 println!("LLM PARSED QUERY: {:?}", parsed);
                 if parsed.confidence > 0.7 {
-                    state.llm_processor.convert_to_search_query(&parsed)
+                    let converted_query = state.llm_processor.convert_to_search_query(&parsed);
+                    (converted_query, Some(parsed))
                 } else {
-                    query.clone()
+                    (query.clone(), None)
                 }
             }
             Err(e) => {
                 println!("LLM parsing failed: {}", e);
-                query.clone()
+                (query.clone(), None)
             }
         }
     } else {
-        query.clone()
+        (query.clone(), None)
     };
 
-    // Special handling for time-based queries (like "find me all the latest files")
-    if enhanced_query.trim().is_empty() && is_natural_language {
-        println!("Detected time-based query, returning recent files");
-        return get_recent_files(state).await;
+    // Special handling for time-based queries
+    if let Some(ref parsed) = parsed_query {
+        if parsed.intent == llm_integration::QueryIntent::FindByTime {
+            if enhanced_query.trim().is_empty() {
+                println!("Detected time-based query for all files, returning recent files");
+                return get_recent_files(state).await;
+            } else {
+                println!("Detected time-based query with filters: '{}'", enhanced_query);
+                // Will use timestamp filtering in the search logic below
+            }
+        }
     }
 
     // Check cache first (for exact queries, cache for 30 seconds)
@@ -1016,26 +1024,62 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             let start_time = Instant::now();
             
             if let Some(sql_pattern) = &pattern_info.sql_like_pattern {
-                let (query_sql, limit) = match pattern_info.pattern_type {
+                let (base_query_sql, limit) = match pattern_info.pattern_type {
                     PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
                         // For *.ext patterns, very restrictive limit for 1.5M files
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY length(name) LIMIT ?2", 500)
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 500)
                     },
                     PatternType::SimplePrefix => {
                         // For prefix patterns, moderate limit with fast exact matching
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", 1000)
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 1000)
                     },
                     PatternType::LiteralSearch if query.contains(' ') => {
                         // For multi-word literal searches, very conservative limit
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) ORDER BY length(name) LIMIT ?2", 300)
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 300)
                     },
                     _ => {
                         // For other patterns, ultra-conservative limit
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) ORDER BY length(name) LIMIT ?2", 200)
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 200)
                     }
                 };
                 
-                let mut stmt = db.prepare(query_sql).map_err(|e| e.to_string())?;
+                // Apply time constraints and ordering
+                let query_sql = if let Some(ref parsed) = parsed_query {
+                    if let Some(ref time_constraint) = parsed.time_constraint {
+                        match time_constraint.as_str() {
+                            "recent" | "today" => {
+                                // Files modified in last 7 days, ordered by modification time
+                                let seven_days_ago = chrono::Utc::now().timestamp() - (7 * 24 * 60 * 60);
+                                format!("{} AND modified_at > {} ORDER BY modified_at DESC LIMIT ?2", base_query_sql, seven_days_ago)
+                            }
+                            "yesterday" => {
+                                // Files modified yesterday
+                                let yesterday = chrono::Utc::now().timestamp() - (24 * 60 * 60);
+                                format!("{} AND modified_at > {} ORDER BY modified_at DESC LIMIT ?2", base_query_sql, yesterday)
+                            }
+                            "last_week" => {
+                                // Files modified in last week
+                                let last_week = chrono::Utc::now().timestamp() - (7 * 24 * 60 * 60);
+                                format!("{} AND modified_at > {} ORDER BY modified_at DESC LIMIT ?2", base_query_sql, last_week)
+                            }
+                            _ => format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                        }
+                    } else {
+                        // Regular ordering for non-time queries
+                        match pattern_info.pattern_type {
+                            PatternType::SimplePrefix => format!("{} ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", base_query_sql),
+                            _ => format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                        }
+                    }
+                } else {
+                    // Regular ordering for non-natural language queries
+                    match pattern_info.pattern_type {
+                        PatternType::SimplePrefix => format!("{} ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", base_query_sql),
+                        _ => format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                    }
+                };
+                
+                let mut stmt = db.prepare(&query_sql).map_err(|e| e.to_string())?;
                 let results: Vec<(String, String, Option<i64>)> = stmt.query_map([sql_pattern, &limit.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())

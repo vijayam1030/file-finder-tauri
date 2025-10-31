@@ -106,7 +106,6 @@ struct PatternInfo {
     suffix: Option<String>,
     can_use_sql_optimization: bool,
     sql_like_pattern: Option<String>,
-    regex_pattern: String,
 }
 
 #[derive(Debug, Clone)]
@@ -140,7 +139,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
                 suffix: Some(extension.to_string()),
                 can_use_sql_optimization: true,
                 sql_like_pattern: Some(format!("%.{}", extension)),
-                regex_pattern: actual_pattern.to_string(),
             };
         } else if actual_pattern.ends_with('*') && actual_pattern.matches('*').count() == 1 {
             // prefix* pattern
@@ -151,7 +149,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
                 suffix: None,
                 can_use_sql_optimization: true,
                 sql_like_pattern: Some(format!("{}%", prefix)),
-                regex_pattern: actual_pattern.to_string(),
             };
         }
     }
@@ -166,7 +163,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
                 suffix: None,
                 can_use_sql_optimization: true,
                 sql_like_pattern: Some(format!("{}%", prefix)),
-                regex_pattern: actual_pattern.to_string(),
             };
         } else if let Some(suffix) = extract_regex_suffix(actual_pattern, &prefix) {
             // prefix.*suffix pattern
@@ -176,7 +172,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
                 suffix: Some(suffix),
                 can_use_sql_optimization: true,
                 sql_like_pattern: Some(format!("{}%", prefix)),
-                regex_pattern: actual_pattern.to_string(),
             };
         }
     }
@@ -198,7 +193,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
                     can_use_sql_optimization: true,
                     // Use the concatenated version for better matching
                     sql_like_pattern: Some(format!("%{}%", concatenated)),
-                    regex_pattern: actual_pattern.to_string(),
                 };
             }
         }
@@ -209,7 +203,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
             suffix: None,
             can_use_sql_optimization: true,
             sql_like_pattern: Some(format!("%{}%", actual_pattern)),
-            regex_pattern: actual_pattern.to_string(),
         };
     }
     
@@ -220,7 +213,6 @@ fn analyze_regex_pattern(query: &str) -> PatternInfo {
         suffix: None,
         can_use_sql_optimization: false,
         sql_like_pattern: None,
-        regex_pattern: actual_pattern.to_string(),
     }
 }
 
@@ -903,45 +895,7 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
 }
 
 
-// Convert glob pattern to regex pattern
-fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::with_capacity(glob.len() * 2);
-    
-    // Add start anchor if the pattern doesn't start with *
-    if !glob.starts_with('*') {
-        regex.push('^');
-    }
-    
-    for ch in glob.chars() {
-        match ch {
-            '*' => regex.push_str(".*"),      // * matches any sequence of characters
-            '?' => regex.push('.'),           // ? matches any single character
-            '.' => regex.push_str("\\."),     // Escape literal dots
-            '+' => regex.push_str("\\+"),     // Escape literal plus
-            '^' => regex.push_str("\\^"),     // Escape literal caret
-            '$' => regex.push_str("\\$"),     // Escape literal dollar
-            '(' => regex.push_str("\\("),     // Escape literal parentheses
-            ')' => regex.push_str("\\)"),
-            '[' => regex.push_str("\\["),     // Escape literal brackets
-            ']' => regex.push_str("\\]"),
-            '{' => regex.push_str("\\{"),     // Escape literal braces
-            '}' => regex.push_str("\\}"),
-            '|' => regex.push_str("\\|"),     // Escape literal pipe
-            '\\' => regex.push_str("\\\\"),   // Escape literal backslash
-            c => regex.push(c),               // Regular characters pass through
-        }
-    }
-    
-    // Add end anchor if the pattern doesn't end with *
-    if !glob.ends_with('*') {
-        regex.push('$');
-    }
-    
-    // Make it case-insensitive by default and add debug output
-    let final_regex = format!("(?i){}", regex);
-    println!("Glob '{}' converted to regex: '{}'", glob, final_regex);
-    final_regex
-}
+
 
 #[tauri::command]
 async fn search_files(query: String, options: Option<SearchOptions>, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
@@ -1018,7 +972,44 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         let pattern_info = analyze_regex_pattern(&enhanced_query);
         println!("PATTERN ANALYSIS for '{}': {:?}", enhanced_query, pattern_info);
         
-        // SEARCH FILES - use optimized strategy based on pattern analysis
+        // EMERGENCY SAFETY: Quick return for very short queries to avoid massive searches
+    if query.len() < 2 {
+        println!("Query too short ({}), returning empty results", query.len());
+        return Ok(vec![]);
+    }
+
+    // ENHANCED SEARCH: Handle "file finder" → "file-finder" and similar patterns
+    let normalized_query = query.to_lowercase();
+    let is_file_finder_search = normalized_query.contains("file finder") || 
+                               normalized_query.contains("file-finder") || 
+                               normalized_query.contains("file_finder") ||
+                               normalized_query == "file finder" ||
+                               normalized_query == "file-finder";
+    
+    // Create alternative search patterns for hyphen/space/underscore variations
+    let alternative_patterns = if normalized_query.contains(' ') {
+        // "file finder" → also search for "file-finder", "file_finder"
+        vec![
+            query.replace(' ', "-"),
+            query.replace(' ', "_"),
+            query.replace(' ', "")
+        ]
+    } else if normalized_query.contains('-') {
+        // "file-finder" → also search for "file finder", "file_finder"  
+        vec![
+            query.replace('-', " "),
+            query.replace('-', "_"),
+            query.replace('-', "")
+        ]
+    } else {
+        vec![]
+    };
+    
+    if is_file_finder_search {
+        println!("Detected file-finder search for '{}', will search alternatives: {:?}", query, alternative_patterns);
+    }
+
+    // SEARCH FILES - use optimized strategy based on pattern analysis
         let files: Vec<(String, String, Option<i64>)> = if pattern_info.can_use_sql_optimization {
             // OPTIMIZED PATH: Use SQL LIKE for pre-filtering
             let start_time = Instant::now();
@@ -1026,20 +1017,20 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             if let Some(sql_pattern) = &pattern_info.sql_like_pattern {
                 let (base_query_sql, limit) = match pattern_info.pattern_type {
                     PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
-                        // For *.ext patterns, very restrictive limit for 1.5M files
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 500)
+                        // EMERGENCY FIX: Ultra-low limits for 1.5M files
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 50)
                     },
                     PatternType::SimplePrefix => {
-                        // For prefix patterns, moderate limit with fast exact matching
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 1000)
+                        // EMERGENCY FIX: Much smaller limit
+                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 100)
                     },
                     PatternType::LiteralSearch if query.contains(' ') => {
-                        // For multi-word literal searches, very conservative limit
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 300)
+                        // EMERGENCY FIX: Tiny limit for multi-word searches
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 30)
                     },
                     _ => {
-                        // For other patterns, ultra-conservative limit
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 200)
+                        // EMERGENCY FIX: Minimal limit for other patterns
+                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 25)
                     }
                 };
                 
@@ -1068,22 +1059,77 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                         // Regular ordering for non-time queries
                         match pattern_info.pattern_type {
                             PatternType::SimplePrefix => format!("{} ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", base_query_sql),
-                            _ => format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                            _ => if is_file_finder_search {
+                                format!("{} ORDER BY CASE WHEN name LIKE '%.exe' THEN 0 WHEN name LIKE '%.bat' THEN 1 ELSE 2 END, length(name) LIMIT ?2", base_query_sql)
+                            } else {
+                                format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                            }
                         }
                     }
                 } else {
                     // Regular ordering for non-natural language queries
                     match pattern_info.pattern_type {
                         PatternType::SimplePrefix => format!("{} ORDER BY CASE WHEN name LIKE ?1 THEN 0 ELSE 1 END, length(name) LIMIT ?2", base_query_sql),
-                        _ => format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                        _ => if is_file_finder_search {
+                            format!("{} ORDER BY CASE WHEN name LIKE '%.exe' THEN 0 WHEN name LIKE '%.bat' THEN 1 ELSE 2 END, length(name) LIMIT ?2", base_query_sql)
+                        } else {
+                            format!("{} ORDER BY length(name) LIMIT ?2", base_query_sql)
+                        }
                     }
                 };
                 
                 let mut stmt = db.prepare(&query_sql).map_err(|e| e.to_string())?;
-                let results: Vec<(String, String, Option<i64>)> = stmt.query_map([sql_pattern, &limit.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                let mut results: Vec<(String, String, Option<i64>)> = stmt.query_map([sql_pattern, &limit.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(|e| e.to_string())?
                     .filter_map(|r| r.ok())
                     .collect();
+                
+                // ENHANCED: Search for alternative patterns (hyphen/space/underscore variations)
+                if !alternative_patterns.is_empty() {
+                    for alt_pattern in &alternative_patterns {
+                        if let Some(alt_sql_pattern) = pattern_info.sql_like_pattern.as_ref() {
+                            let alt_sql = alt_sql_pattern.replace(&query, alt_pattern);
+                            let alt_query_sql = query_sql.replace(sql_pattern, &alt_sql);
+                            
+                            if let Ok(mut alt_stmt) = db.prepare(&alt_query_sql) {
+                                if let Ok(mapped_rows) = alt_stmt.query_map([&alt_sql, &limit.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))) {
+                                    let alt_results: Vec<(String, String, Option<i64>)> = mapped_rows
+                                        .filter_map(|r| r.ok())
+                                        .collect();
+                                
+                                    // Add alternative results, avoiding duplicates
+                                    for alt_result in alt_results {
+                                        if !results.iter().any(|r| r.0 == alt_result.0) {
+                                            results.push(alt_result);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // DIRECTORY SEARCH: Look for files in directories with the target name
+                    if is_file_finder_search {
+                        let dir_search_sql = "SELECT path, name, modified_at FROM files WHERE path LIKE ? LIMIT 10";
+                        if let Ok(mut dir_stmt) = db.prepare(dir_search_sql) {
+                            for pattern in std::iter::once(&query).chain(alternative_patterns.iter()) {
+                                let dir_pattern = format!("%{}%", pattern);
+                                if let Ok(mapped_rows) = dir_stmt.query_map([&dir_pattern], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))) {
+                                    let dir_results: Vec<(String, String, Option<i64>)> = mapped_rows
+                                        .filter_map(|r| r.ok())
+                                        .collect();
+                                
+                                    // Add directory-based results
+                                    for dir_result in dir_results {
+                                        if !results.iter().any(|r| r.0 == dir_result.0) {
+                                            results.push(dir_result);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let duration = start_time.elapsed();
                 println!("OPTIMIZED SQL: Pattern '{}' → SQL '{}' found {} files in {}ms", 
                          query, sql_pattern, results.len(), duration.as_millis());
@@ -1092,9 +1138,9 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 vec![]
             }
         } else {
-            // COMPLEX REGEX PATH: Load files for full regex matching - very limited for 1.5M files
+            // COMPLEX REGEX PATH: Emergency performance fix - drastically reduce limits
             let start_time = Instant::now();
-            let limit = if pattern_info.prefix.is_some() { 2000 } else { 1000 };
+            let limit = if pattern_info.prefix.is_some() { 100 } else { 50 }; // MUCH smaller limits!
             
             let mut stmt = db
                 .prepare(&format!("SELECT path, name, modified_at FROM files LIMIT {}", limit))

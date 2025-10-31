@@ -11,9 +11,11 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use chrono::Utc;
 
 mod llm_integration;
+mod fzf_search;
 use regex::Regex;
 use std::collections::{HashSet, HashMap};
 use rayon::prelude::*;
+use fzf_search::FzfSearchEngine;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchOptions {
@@ -86,6 +88,8 @@ pub struct AppState {
     regex_cache: Mutex<HashMap<String, Regex>>,
     // LLM processor for natural language queries
     llm_processor: llm_integration::LLMProcessor,
+    // FZF-style in-memory search engine for real-time search
+    fzf_engine: Mutex<FzfSearchEngine>,
 }
 
 // Fuzzy matching helper function
@@ -428,11 +432,19 @@ impl AppState {
             )?;
         }
 
+        let mut fzf_engine = FzfSearchEngine::new();
+        
+        // Load FZF index on startup
+        if let Err(e) = fzf_engine.load_from_database(&conn) {
+            println!("Failed to load FZF index: {}", e);
+        }
+        
         Ok(AppState {
             db: Mutex::new(conn),
             search_cache: Mutex::new(HashMap::new()),
             regex_cache: Mutex::new(HashMap::new()),
             llm_processor: llm_integration::LLMProcessor::new(),
+            fzf_engine: Mutex::new(fzf_engine),
         })
     }
 }
@@ -1594,6 +1606,50 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
 }
 
 #[tauri::command]
+async fn fzf_search(state: State<'_, AppState>, query: String, limit: Option<usize>) -> Result<Vec<(String, String, Option<i64>)>, String> {
+    let fzf_engine = state.fzf_engine.lock().map_err(|e| e.to_string())?;
+    
+    let search_limit = limit.unwrap_or(50); // Default to 50 results
+    let results = fzf_engine.search(&query, search_limit);
+    
+    println!("FZF Debug: Found {} results for query '{}'", results.len(), query);
+    for (i, (score, file)) in results.iter().take(5).enumerate() {
+        println!("  Result {}: score={} name='{}' path='{}'", i, score, file.name, file.path);
+    }
+    
+    // Aggressive filtering: eliminate UE "0" folder spam unless specifically searching for "0"
+    let filtered_results: Vec<_> = if query != "0" && query != "0/" && !query.to_lowercase().contains("external") {
+        results.into_iter()
+            .filter(|(score, file)| {
+                // Remove ALL Unreal Engine __External* "0" folders for better user experience
+                !(file.name == "0" && file.path.contains("__External") && *score <= 3000)
+            })
+            .collect()
+    } else {
+        results // Keep all results if specifically searching for "0" or "external"
+    };
+    
+    println!("FZF Debug: After filtering: {} results", filtered_results.len());
+    
+    // Convert to expected format (path, name, modified_at)
+    let formatted_results: Vec<(String, String, Option<i64>)> = filtered_results
+        .into_iter()
+        .map(|(_score, file)| (file.path.clone(), file.name.clone(), file.modified_at))
+        .collect();
+    
+    Ok(formatted_results)
+}
+
+#[tauri::command]
+async fn refresh_fzf_index(state: State<'_, AppState>) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut fzf_engine = state.fzf_engine.lock().map_err(|e| e.to_string())?;
+    
+    fzf_engine.load_from_database(&db)?;
+    Ok(format!("FZF index refreshed with {} files", fzf_engine.files.len()))
+}
+
+#[tauri::command]
 async fn natural_language_search(query: String, state: State<'_, AppState>) -> Result<llm_integration::NaturalQuery, String> {
     if query.trim().is_empty() {
         return Err("Query cannot be empty".to_string());
@@ -1931,6 +1987,8 @@ pub fn run() {
             start_indexing,
             index_custom_folder,
             search_files,
+            fzf_search,
+            refresh_fzf_index,
             natural_language_search,
             get_recent_files,
             open_file,

@@ -130,7 +130,7 @@ window.addEventListener("DOMContentLoaded", async () => {
                 const currentQuery = searchInput.value.trim();
                 if (currentQuery && activeTab === 'search') {
                   console.log("Refreshing search results after indexing...");
-                  await performSearch(currentQuery);
+                  await performFzfSearch(currentQuery);
                 }
                 
                 // Reload recent files and favorites
@@ -220,7 +220,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           searchInput.value = pattern;
           searchInput.focus();
           regexHelpPanel.classList.add("hidden");
-          performSearch(pattern);
+          performFzfSearch(pattern);
         }
       });
     });
@@ -229,22 +229,22 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Setup settings checkboxes
   document.getElementById("search-folders").addEventListener("change", (e) => {
     searchOptions.search_folders = e.target.checked;
-    performSearch(searchInput.value.trim());
+    performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-fuzzy").addEventListener("change", (e) => {
     searchOptions.enable_fuzzy = e.target.checked;
-    performSearch(searchInput.value.trim());
+    performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-strict").addEventListener("change", (e) => {
     searchOptions.strict_mode = e.target.checked;
-    performSearch(searchInput.value.trim());
+    performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-filename-only").addEventListener("change", (e) => {
     searchOptions.filename_only = e.target.checked;
-    performSearch(searchInput.value.trim());
+    performFzfSearch(searchInput.value.trim());
   });
   
   // Auto reindex checkbox listener
@@ -346,7 +346,7 @@ function switchTab(tabName) {
     // Switch to search tab - if there's a query, perform search
     const query = searchInput.value.trim();
     if (query) {
-      performSearch(query);
+      performFzfSearch(query);
     } else {
       // Clear search results when switching to empty search
       renderSearchResults([]);
@@ -370,17 +370,133 @@ function handleSearch() {
   }
   
   clearTimeout(searchTimeout);
+  
+  // FZF MODE: Much faster debouncing for real-time search
+  const query = searchInput.value.trim();
+  
+  if (query.length === 0) {
+    clearResults();
+    return;
+  }
+  
+  // Adaptive debouncing: shorter for single words, longer for multi-word
+  const wordCount = query.split(/\s+/).length;
+  const debounceTime = wordCount > 1 ? 200 : query.length < 3 ? 150 : 30; // Much faster for simple queries
+  
   searchTimeout = setTimeout(async () => {
-    const query = searchInput.value.trim();
-    await performSearch(query);
-  }, 150); // Debounce 150ms to reduce flicker
+    await performFzfSearch(query);
+  }, debounceTime);
 }
 
 // Track the current search to prevent race conditions
 let currentSearchId = 0;
 
+// FZF-style real-time search
+async function performFzfSearch(query) {
+  const searchId = ++currentSearchId;
+  
+  try {
+    const start = performance.now();
+    
+    // Call the fast FZF search backend
+    const results = await invoke('fzf_search', { 
+      query: query,
+      limit: 50 // Limit for fast response
+    });
+    
+    const duration = performance.now() - start;
+    
+    // Only update if this is still the current search
+    if (searchId === currentSearchId) {
+      console.log("FZF Frontend: Processing results for query:", query);
+      
+      // Get favorites for prioritization
+      let favorites = [];
+      try {
+        favorites = await invoke("get_favorites");
+        console.log("FZF Debug: Loaded favorites:", favorites);
+      } catch (error) {
+        console.warn("Could not load favorites:", error);
+      }
+      const favoritePaths = new Set(favorites);
+      console.log("FZF Debug: Favorite paths set:", Array.from(favoritePaths));
+      
+      const formattedResults = results.map(([path, name, modifiedAt]) => {
+        // Check exact match first
+        let isFav = favoritePaths.has(path);
+        
+        // If not exact match, check if any favorite is a parent directory
+        if (!isFav) {
+          for (const favPath of favoritePaths) {
+            if (path.startsWith(favPath + '\\') || path.startsWith(favPath + '/')) {
+              isFav = true;
+              console.log("FZF Debug: Found favorite child!", name, "at", path, "parent favorite:", favPath);
+              break;
+            }
+          }
+        }
+        
+        if (isFav && favoritePaths.has(path)) {
+          console.log("FZF Debug: Found exact favorite!", name, "at", path);
+        }
+        
+        return {
+          path,
+          name,
+          modified_at: modifiedAt,
+          isFavorite: isFav // Add favorite flag
+        };
+      });
+      
+      // Sort to prioritize favorites
+      const sortedResults = formattedResults.sort((a, b) => {
+        // Favorites first
+        if (a.isFavorite && !b.isFavorite) return -1;
+        if (!a.isFavorite && b.isFavorite) return 1;
+        // Then maintain original order (already scored by FZF)
+        return 0;
+      });
+      
+      currentResults = sortedResults;
+      renderSearchResults(sortedResults);
+      
+      // Show performance info
+      console.log(`FZF search for "${query}": ${results.length} results in ${duration.toFixed(1)}ms`);
+      
+      // Debug: Show what we're actually displaying
+      console.log("FZF Frontend Debug: Displaying results:");
+      sortedResults.slice(0, 5).forEach((result, i) => {
+        console.log(`  ${i}: ${result.name} at ${result.path} ${result.isFavorite ? '(FAV)' : ''}`);
+      });
+    }
+  } catch (error) {
+    console.error('FZF search failed:', error);
+    // Temporarily disable fallback to isolate FZF performance
+    if (searchId === currentSearchId) {
+      currentResults = [];
+      renderSearchResults([]); // Show empty results instead of falling back
+      console.error('FZF search error - fallback disabled for debugging:', error);
+    }
+  }
+}
+
+// Clear search results
+function clearResults() {
+  currentResults = [];
+  selectedIndex = 0;
+  if (resultsList) {
+    resultsList.innerHTML = '';
+  }
+}
+
 // Perform search
+// OLD SEARCH FUNCTION - DISABLED TO PREVENT DUAL EXECUTION
 async function performSearch(query) {
+  console.warn("OLD performSearch called - this should not happen! Redirecting to FZF search.");
+  return await performFzfSearch(query);
+  
+  // DISABLED CODE BELOW - DO NOT REMOVE (for reference)
+  /*
   const searchId = ++currentSearchId;
   
   try {
@@ -433,6 +549,7 @@ async function performSearch(query) {
       renderSearchResults([]);
     }
   }
+  */
 }
 
 // Sort recent files based on the selected criteria
@@ -642,7 +759,8 @@ async function renderSearchResults(results) {
       }
       
       const isRecent = recentPaths.has(file.path);
-      const isFavorite = favoritePaths.has(file.path);
+      // Use the isFavorite flag from FZF search (includes parent directory matching)
+      const isFavorite = file.isFavorite || favoritePaths.has(file.path);
 
       return `
         <div class="file-item ${isSelected ? 'selected' : ''}" data-index="${index}" data-path="${escapeHtml(file.path)}">
@@ -897,7 +1015,7 @@ function handleKeyboard(e) {
     const currentQuery = searchInput.value.trim();
     if (currentQuery) {
       console.log("Force refreshing search for:", currentQuery);
-      performSearch(currentQuery);
+      performFzfSearch(currentQuery);
     }
     return;
   }

@@ -25,6 +25,7 @@ pub struct SearchOptions {
     pub enable_fuzzy: bool,
     pub strict_mode: bool,
     pub filename_only: bool,
+    pub applications_only: bool,
 }
 
 impl Default for SearchOptions {
@@ -34,6 +35,7 @@ impl Default for SearchOptions {
             enable_fuzzy: true,
             strict_mode: false,
             filename_only: false,
+            applications_only: false,
         }
     }
 }
@@ -753,6 +755,11 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
     // Early termination for fuzzy search - process more files if query looks like it needs normalization
     let search_limit = if query_normalized != query_trimmed.to_lowercase().replace(' ', "") { 1000 } else { 300 };
     for (path, name) in files.into_iter().take(search_limit) {
+        // Apply applications filter if enabled
+        if options.applications_only && !name.to_lowercase().ends_with(".exe") {
+            continue;
+        }
+        
         let name_l = name.to_lowercase();
         let path_l = path.to_lowercase();
         let name_normalized = normalize_for_matching(&name);
@@ -940,6 +947,63 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
 }
 
 #[tauri::command]
+async fn fts_search(query: String, options: Option<SearchOptions>, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
+    let search_opts = options.unwrap_or_default();
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    
+    // Check if FTS table exists and has data
+    let fts_count: i64 = match db.query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0)) {
+        Ok(count) => count,
+        Err(_) => 0,
+    };
+    
+    if fts_count == 0 {
+        return Ok(vec![]);
+    }
+
+    let fts_query = format!("{}*", query.replace(' ', "* "));
+    
+    let fts_sql = if search_opts.applications_only {
+        "SELECT files.path, files.name, files.modified_at 
+         FROM files_fts 
+         JOIN files ON files_fts.rowid = files.id 
+         WHERE files_fts MATCH ? AND LOWER(files.name) LIKE '%.exe'
+         ORDER BY rank 
+         LIMIT 200"
+    } else {
+        "SELECT files.path, files.name, files.modified_at 
+         FROM files_fts 
+         JOIN files ON files_fts.rowid = files.id 
+         WHERE files_fts MATCH ? 
+         ORDER BY rank 
+         LIMIT 200"
+    };
+    
+    let results = {
+        let mut stmt = db.prepare(fts_sql).map_err(|e| format!("FTS prepare error: {}", e))?;
+        
+        let rows = stmt.query_map([&fts_query], |row| {
+            Ok(FileEntry {
+                path: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                modified_at: row.get::<_, Option<i64>>(2)?,
+                last_accessed: None,
+                access_count: 0,
+            })
+        }).map_err(|e| format!("FTS query error: {}", e))?;
+        
+        let results: Result<Vec<_>, _> = rows.collect();
+        results.map_err(|e| format!("FTS search error: {}", e))?
+    };
+    
+    Ok(results)
+}
+
+#[tauri::command]
 async fn search_files(query: String, options: Option<SearchOptions>, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
     let search_opts = options.unwrap_or_default();
     if query.trim().is_empty() {
@@ -1060,19 +1124,35 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let (base_query_sql, limit) = match pattern_info.pattern_type {
                     PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
                         // EMERGENCY FIX: Ultra-low limits for 1.5M files
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 50)
+                        if search_opts.applications_only {
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 50)
+                        } else {
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 50)
+                        }
                     },
                     PatternType::SimplePrefix => {
                         // EMERGENCY FIX: Much smaller limit
-                        ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 100)
+                        if search_opts.applications_only {
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 100)
+                        } else {
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 100)
+                        }
                     },
                     PatternType::LiteralSearch if query.contains(' ') => {
                         // EMERGENCY FIX: Tiny limit for multi-word searches
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 30)
+                        if search_opts.applications_only {
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 30)
+                        } else {
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 30)
+                        }
                     },
                     _ => {
                         // EMERGENCY FIX: Minimal limit for other patterns
-                        ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 25)
+                        if search_opts.applications_only {
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 25)
+                        } else {
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 25)
+                        }
                     }
                 };
                 
@@ -1266,12 +1346,21 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
                 let fts_query = format!("{}*", query.replace(' ', "* "));
                 println!("FTS5 query: '{}'", fts_query);
                 
-                let fts_sql = "SELECT files.path, files.name, files.modified_at 
-                              FROM files_fts 
-                              JOIN files ON files_fts.rowid = files.id 
-                              WHERE files_fts MATCH ? 
-                              ORDER BY rank 
-                              LIMIT 100";
+                let fts_sql = if search_opts.applications_only {
+                    "SELECT files.path, files.name, files.modified_at 
+                     FROM files_fts 
+                     JOIN files ON files_fts.rowid = files.id 
+                     WHERE files_fts MATCH ? AND LOWER(files.name) LIKE '%.exe'
+                     ORDER BY rank 
+                     LIMIT 100"
+                } else {
+                    "SELECT files.path, files.name, files.modified_at 
+                     FROM files_fts 
+                     JOIN files ON files_fts.rowid = files.id 
+                     WHERE files_fts MATCH ? 
+                     ORDER BY rank 
+                     LIMIT 100"
+                };
                 
                 match db.prepare(fts_sql) {
                     Ok(mut fts_stmt) => {
@@ -2124,6 +2213,7 @@ async fn debug_search_scores(state: State<'_, AppState>, query: String) -> Resul
         enable_fuzzy: true,
         strict_mode: false,
         filename_only: true,
+        applications_only: false,
     };
     
     let results = fuzzy_search_files(files, &query, &[], &[], &options);
@@ -2345,6 +2435,7 @@ pub fn run() {
             index_custom_folder,
             search_files,
             fzf_search,
+            fts_search,
             simple_search,
             refresh_fzf_index,
             natural_language_search,

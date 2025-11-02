@@ -19,7 +19,8 @@ let searchOptions = {
   search_folders: true,
   enable_fuzzy: true,
   strict_mode: false,
-  filename_only: false
+  filename_only: false,
+  applications_only: false
 };
 
 // Sort options
@@ -244,6 +245,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   
   document.getElementById("search-filename-only").addEventListener("change", (e) => {
     searchOptions.filename_only = e.target.checked;
+    performFzfSearch(searchInput.value.trim());
+  });
+  
+  document.getElementById("applications-only").addEventListener("change", (e) => {
+    searchOptions.applications_only = e.target.checked;
     performFzfSearch(searchInput.value.trim());
   });
   

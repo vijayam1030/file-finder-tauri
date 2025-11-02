@@ -384,98 +384,111 @@ function handleSearch() {
   const debounceTime = wordCount > 1 ? 200 : query.length < 3 ? 150 : 30; // Much faster for simple queries
   
   searchTimeout = setTimeout(async () => {
-    await performFzfSearch(query);
+    await performFtsSearch(query);
   }, debounceTime);
 }
 
 // Track the current search to prevent race conditions
 let currentSearchId = 0;
 
-// FZF-style real-time search
-async function performFzfSearch(query) {
+// FTS-style real-time search
+async function performFtsSearch(query) {
+  const searchId = ++currentSearchId;
+  const loadingEl = document.getElementById('search-loading');
+  if (loadingEl) loadingEl.classList.remove('hidden');
+  try {
+    const start = performance.now();
+    // Use the regular search_files function which now includes FTS5 for multi-word queries
+    const results = await invoke('search_files', { query, options: searchOptions });
+    const duration = performance.now() - start;
+    if (searchId === currentSearchId) {
+      if (loadingEl) loadingEl.classList.add('hidden');
+      currentResults = results;
+      renderSearchResults(currentResults);
+      console.log(`Enhanced search for "${query}": ${results.length} results in ${duration.toFixed(1)}ms`);
+    }
+  } catch (error) {
+    if (searchId === currentSearchId) {
+      if (loadingEl) loadingEl.classList.add('hidden');
+      currentResults = [];
+      renderSearchResults([]);
+      console.error('Enhanced search error:', error);
+    }
+  }
+}
+
+// Simple search using nucleo-based engine  
+async function performSimpleSearch(query) {
+  if (!query || query.trim().length === 0) {
+    clearResults();
+    return;
+  }
+
+  console.log("Simple Search: Starting search for:", query);
+  const start = performance.now();
   const searchId = ++currentSearchId;
   
   try {
-    const start = performance.now();
-    
-    // Call the fast FZF search backend
-    const results = await invoke('fzf_search', { 
+    // Call the simple search backend
+    const results = await invoke('simple_search', { 
       query: query,
-      limit: 50 // Limit for fast response
+      limit: 50
     });
     
     const duration = performance.now() - start;
     
     // Only update if this is still the current search
     if (searchId === currentSearchId) {
-      console.log("FZF Frontend: Processing results for query:", query);
+      console.log("Simple Search: Processing results for query:", query);
       
       // Get favorites for prioritization
       let favorites = [];
       try {
         favorites = await invoke("get_favorites");
-        console.log("FZF Debug: Loaded favorites:", favorites);
       } catch (error) {
         console.warn("Could not load favorites:", error);
       }
       const favoritePaths = new Set(favorites);
-      console.log("FZF Debug: Favorite paths set:", Array.from(favoritePaths));
       
       const formattedResults = results.map(([path, name, modifiedAt]) => {
-        // Check exact match first
+        // Check if favorite (exact match or parent directory)
         let isFav = favoritePaths.has(path);
-        
-        // If not exact match, check if any favorite is a parent directory
         if (!isFav) {
           for (const favPath of favoritePaths) {
             if (path.startsWith(favPath + '\\') || path.startsWith(favPath + '/')) {
               isFav = true;
-              console.log("FZF Debug: Found favorite child!", name, "at", path, "parent favorite:", favPath);
               break;
             }
           }
-        }
-        
-        if (isFav && favoritePaths.has(path)) {
-          console.log("FZF Debug: Found exact favorite!", name, "at", path);
         }
         
         return {
           path,
           name,
           modified_at: modifiedAt,
-          isFavorite: isFav // Add favorite flag
+          isFavorite: isFav
         };
       });
       
-      // Sort to prioritize favorites
+      // Sort: favorites first, then by name
       const sortedResults = formattedResults.sort((a, b) => {
-        // Favorites first
-        if (a.isFavorite && !b.isFavorite) return -1;
-        if (!a.isFavorite && b.isFavorite) return 1;
-        // Then maintain original order (already scored by FZF)
-        return 0;
+        if (a.isFavorite !== b.isFavorite) {
+          return b.isFavorite ? 1 : -1;
+        }
+        return a.name.localeCompare(b.name);
       });
       
+      selectedIndex = 0;
       currentResults = sortedResults;
       renderSearchResults(sortedResults);
       
-      // Show performance info
-      console.log(`FZF search for "${query}": ${results.length} results in ${duration.toFixed(1)}ms`);
-      
-      // Debug: Show what we're actually displaying
-      console.log("FZF Frontend Debug: Displaying results:");
-      sortedResults.slice(0, 5).forEach((result, i) => {
-        console.log(`  ${i}: ${result.name} at ${result.path} ${result.isFavorite ? '(FAV)' : ''}`);
-      });
+      console.log(`Simple search for "${query}": ${results.length} results in ${duration.toFixed(1)}ms`);
     }
   } catch (error) {
-    console.error('FZF search failed:', error);
-    // Temporarily disable fallback to isolate FZF performance
+    console.error('Simple search failed:', error);
     if (searchId === currentSearchId) {
       currentResults = [];
-      renderSearchResults([]); // Show empty results instead of falling back
-      console.error('FZF search error - fallback disabled for debugging:', error);
+      renderSearchResults([]);
     }
   }
 }
@@ -492,8 +505,8 @@ function clearResults() {
 // Perform search
 // OLD SEARCH FUNCTION - DISABLED TO PREVENT DUAL EXECUTION
 async function performSearch(query) {
-  console.warn("OLD performSearch called - this should not happen! Redirecting to FZF search.");
-  return await performFzfSearch(query);
+  console.warn("OLD performSearch called - this should not happen! Redirecting to FTS search.");
+  return await performFtsSearch(query);
   
   // DISABLED CODE BELOW - DO NOT REMOVE (for reference)
   /*

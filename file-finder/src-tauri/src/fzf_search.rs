@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
+use nucleo_matcher::{Matcher, Config};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileIndex {
@@ -12,14 +13,32 @@ pub struct FileIndex {
 pub struct FzfSearchEngine {
     pub files: Vec<FileIndex>,
     pub matcher: SkimMatcherV2,
+    pub nucleo_matcher: Matcher,
     pub last_update: std::time::Instant,
 }
 
 impl FzfSearchEngine {
+    // Helper: Split camelCase and PascalCase into lowercase words
+    fn split_camel_case(s: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        for c in s.chars() {
+            if c.is_uppercase() && !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            current.push(c.to_ascii_lowercase());
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
+    }
     pub fn new() -> Self {
         Self {
             files: Vec::new(),
             matcher: SkimMatcherV2::default(),
+            nucleo_matcher: Matcher::new(Config::DEFAULT),
             last_update: std::time::Instant::now(),
         }
     }
@@ -84,18 +103,27 @@ impl FzfSearchEngine {
         let query_lower = query.to_lowercase();
         let start_time = std::time::Instant::now();
         
-        // OPTIMIZATION: For multi-word queries, split and require all words
-        let words: Vec<&str> = query_lower.split_whitespace().collect();
-        let is_multi_word = words.len() > 1;
+
+        
+
+        
+    // OPTIMIZATION: For multi-word queries, split and require all words
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let is_multi_word = query_words.len() > 1;
+        
+        // Debug for multi-word searches
+        if is_multi_word {
+            println!("FZF Debug: Multi-word search '{}' - looking for files with both terms", query);
+        }
         
         // Special pattern generation for common cases
-        let special_patterns: Vec<String> = if is_multi_word && words.len() == 2 {
+        let special_patterns: Vec<String> = if is_multi_word && query_words.len() == 2 {
             vec![
-                words.join("-"),     // "file finder" -> "file-finder"
-                words.join("_"),     // "file finder" -> "file_finder"
-                words.join(""),      // "filefinder" -> "filefinder"
-                format!("{}\\{}", words.join("-"), words[0]), // Look for project structure like "file-finder\file"
-                format!("{}\\{}", words.join("_"), words[0]), // Look for "file_finder\file"
+                query_words.join("-"),     // "file finder" -> "file-finder"
+                query_words.join("_"),     // "file finder" -> "file_finder"
+                query_words.join("") ,     // "filefinder" -> "filefinder"
+                format!("{}\\{}", query_words.join("-"), query_words[0]), // Look for project structure like "file-finder\file"
+                format!("{}\\{}", query_words.join("_"), query_words[0]), // Look for "file_finder\file"
             ]
         } else {
             Vec::new()
@@ -144,6 +172,8 @@ impl FzfSearchEngine {
                     }
                 }
                 println!("FZF Debug: Pattern '{}' found {} matches", pattern, pattern_matches);
+        
+
             }
         }
         
@@ -196,36 +226,261 @@ impl FzfSearchEngine {
             }
         }
         
-        // Phase 3: Contains matches (ULTRA aggressive limits for multi-word)
+        // Phase 3: Contains matches (much larger scan for multi-word)
         if results.len() < limit {
-            let contains_limit = if is_multi_word { limit.min(15) } else { limit };
-            let max_scan = if is_multi_word { 25000 } else { 100000 }; // ULTRA aggressive scanning
-            
+            let contains_limit = if is_multi_word { limit.min(25) } else { limit };
+            // CRITICAL: With large databases (1M+ files), need to scan much more for multi-word
+            let max_scan = if is_multi_word { 200000 } else { 100000 }; // Scan up to 200k files for multi-word
+
+            let mut scanned_files = 0;
             for (i, file) in self.files.iter().enumerate() {
-                if i > max_scan || (is_multi_word && i > 10000 && results.len() >= 3) { break; } // HYPER aggressive termination
+                // Only stop early if we have good distributed matches
+                if i > max_scan || (is_multi_word && i > 100000 && results.len() >= 10) {
+                    if is_multi_word {
+                        println!("FZF Debug: Stopped scanning at {} files with {} results", scanned_files, results.len());
+                    }
+                    break;
+                }
+                scanned_files += 1;
+
+                // Enhanced matching: check both filename and path segments
+                let path_lower = file.path.to_lowercase();
                 
                 let matches = if is_multi_word {
-                    // Multi-word: More flexible - any word can be in name or path
-                    let path_lower = file.path.to_lowercase();
-                    let combined = format!("{} {}", file.name_lower, path_lower);
+                    // Multi-word: Enhanced fuzzy matching with partial word support
+                    // Split path into segments for better matching
+                    let path_segments: Vec<&str> = path_lower.split("\\").chain(path_lower.split("/")).collect();
+                    let name_camel = Self::split_camel_case(&file.name);
+                    let _path_camel: Vec<String> = path_segments.iter().flat_map(|seg| Self::split_camel_case(seg)).collect();
+                    let all_text = format!("{} {} {} {}", file.name_lower, path_lower, path_segments.join(" "), name_camel.join(" "));
+                    let mut matched_words = 0;
+                    let mut match_details = Vec::new();
                     
-                    // Either all words in combined text, OR most words present
-                    let word_matches = words.iter().filter(|word| combined.contains(*word)).count();
-                    word_matches >= (words.len().saturating_sub(1)).max(1) // Allow missing 1 word for fuzzy matching
+                    for word in &query_words {
+                        let mut word_matched = false;
+                        let mut match_type = "";
+                        
+                        // 1. Check for exact word match first
+                        if all_text.contains(*word) {
+                            matched_words += 1;
+                            word_matched = true;
+                            match_type = "exact";
+                        } 
+                        // 2. For words 3+ chars, check partial matches (more aggressive)
+                        else if word.len() >= 3 {
+                            let partial_match = 
+                                // Check path segments for prefix matches (e.g., "comp" → "competizione")
+                                path_segments.iter().any(|segment| 
+                                    segment.starts_with(*word) && segment.len() > word.len()
+                                ) ||
+                                // Check filename for prefix match  
+                                (file.name_lower.len() > word.len() && file.name_lower.starts_with(*word)) ||
+                                // Check for word as substring in longer words (more aggressive fuzzy matching)
+                                all_text.split_whitespace().any(|text_word| 
+                                    text_word.len() > word.len() && text_word.contains(*word)
+                                ) ||
+                                // Check filename for prefix matches
+                                file.name_lower.starts_with(*word) && file.name_lower.len() > word.len() ||
+                                // Check path parts split by common separators
+                                path_lower.split(&['\\', '/', ' ', '_', '-'][..]).any(|part| 
+                                    part.starts_with(*word) && part.len() > word.len()
+                                ) ||
+                                // Check if the word appears as a substring in larger words
+                                all_text.split_whitespace().any(|part|
+                                    part.len() > word.len() && (
+                                        part.starts_with(*word) || 
+                                        part.contains(&format!("{}", word)) // Contains as substring
+                                    )
+                                );
+                            
+                            if partial_match {
+                                matched_words += 1;
+                                word_matched = true;
+                                match_type = "partial";
+                            }
+                        }
+                        // 3. For very short words (2 chars), be even more flexible
+                        else if word.len() >= 2 {
+                            let fuzzy_match = 
+                                // Allow short words to match anywhere in path or filename
+                                file.name_lower.contains(*word) || 
+                                path_lower.contains(*word) ||
+                                // Check if it's a common abbreviation pattern
+                                path_segments.iter().any(|segment| 
+                                    segment.starts_with(*word) || segment.contains(*word)
+                                );
+                            
+                            if fuzzy_match {
+                                matched_words += 1;
+                                word_matched = true;
+                                match_type = "fuzzy";
+                            }
+                        }
+                        
+                        if word_matched {
+                            match_details.push((word, match_type));
+                        }
+                    }
+                    
+
+                    
+                    // Enhanced scoring: prefer files where words appear in different contexts
+                    let _has_name_match = query_words.iter().any(|word|
+                        file.name_lower.contains(*word) ||
+                        (word.len() >= 3 && (
+                            file.name_lower.starts_with(*word) ||
+                            file.name_lower.split(&[' ', '_', '-'][..]).any(|part| part.starts_with(*word))
+                        ))
+                    );
+                    let _has_path_match = query_words.iter().any(|word|
+                        path_lower.contains(*word) ||
+                        (word.len() >= 3 && (
+                            path_segments.iter().any(|segment| segment.starts_with(*word)) ||
+                            path_lower.split(&['\\', '/', ' ', '_', '-'][..]).any(|part| part.starts_with(*word))
+                        ))
+                    );
+
+                    // Count how many words matched in name vs path for better distributed scoring
+                    let name_matched_count = query_words.iter().filter(|word| {
+                        file.name_lower.contains(**word) ||
+                        (word.len() >= 3 && (
+                            file.name_lower.starts_with(*word) ||
+                            // Check if word matches start of any word in the filename
+                            file.name_lower.split_whitespace().any(|name_word|
+                                name_word.starts_with(*word) && name_word.len() > word.len()
+                            )
+                        ))
+                    }).count();
+                    let path_matched_count = query_words.iter().filter(|word| {
+                        path_lower.contains(**word) ||
+                        (word.len() >= 3 && path_segments.iter().any(|seg|
+                            seg.starts_with(*word) ||
+                            // Check words within segments (for segments with spaces)
+                            seg.split_whitespace().any(|seg_word|
+                                seg_word.starts_with(*word) && seg_word.len() > word.len()
+                            )
+                        ))
+                    }).count();
+
+                    // More flexible matching: allow missing words or require good distribution
+                    let word_threshold = if query_words.len() <= 2 { query_words.len() } else { query_words.len().saturating_sub(1) };
+                    let flexible_match = matched_words >= word_threshold.max(1);
+                    // Distributed match is BETTER: one word in path, one in name
+                    let distributed_match = (name_matched_count >= 1 && path_matched_count >= 1) && matched_words >= 2;
+
+                    // Debug output for multi-word matching
+                    if flexible_match || distributed_match {
+                        println!("FZF Debug: Multi-word match '{}' - matched {}/{} words (name:{}, path:{}): {:?}", file.path, matched_words, query_words.len(), name_matched_count, path_matched_count, match_details);
+                    }
+
+                    flexible_match || distributed_match
                 } else {
-                    // Single word: simple contains
-                    file.name_lower.contains(&query_lower)
+                    // Single word: Enhanced fuzzy matching for both filename and path segments
+                    let exact_match = file.name_lower.contains(&query_lower) || path_lower.contains(&query_lower);
+                    
+                    // Enhanced partial matching for queries 3+ chars
+                    let partial_match = if query_lower.len() >= 3 {
+                        let path_segments: Vec<&str> = path_lower.split('\\').chain(path_lower.split('/')).collect();
+                        
+                        // Check path segments for prefix matches
+                        path_segments.iter().any(|segment| 
+                            segment.starts_with(&query_lower) && segment.len() > query_lower.len()
+                        ) ||
+                        // Check filename for prefix matches
+                        file.name_lower.starts_with(&query_lower) && file.name_lower.len() > query_lower.len() ||
+                        // Check path parts split by common separators
+                        path_lower.split(&['\\', '/', ' ', '_', '-'][..]).any(|part| 
+                            part.starts_with(&query_lower) && part.len() > query_lower.len()
+                        ) ||
+                        // Check all words in the combined text
+                        format!("{} {}", file.name_lower, path_lower)
+                            .split_whitespace()
+                            .any(|word| 
+                                word.len() > query_lower.len() && 
+                                (word.starts_with(&query_lower) || word.contains(&query_lower))
+                            )
+                    } else if query_lower.len() >= 2 {
+                        // For very short queries, be more flexible
+                        file.name_lower.contains(&query_lower) || 
+                        path_lower.contains(&query_lower)
+                    } else {
+                        false
+                    };
+                    
+                    exact_match || partial_match
                 };
                 
                 if matches && !results.iter().any(|(_, f): &(i64, &FileIndex)| f.path == file.path) {
-                    let score = if is_multi_word { 2000 } else { 1000 };
+                    // Enhanced scoring for multi-word queries
+                    let score = if is_multi_word {
+                        // Count how many words matched in name vs path (using improved matching)
+                        let name_matched = query_words.iter().filter(|word| {
+                            file.name_lower.contains(*word) ||
+                            (word.len() >= 3 && (
+                                file.name_lower.starts_with(*word) ||
+                                // Match against words in the filename
+                                file.name_lower.split_whitespace().any(|name_word|
+                                    name_word.starts_with(*word) && name_word.len() > word.len()
+                                )
+                            ))
+                        }).count();
+                        let path_matched = query_words.iter().filter(|word| {
+                            path_lower.contains(*word) ||
+                            (word.len() >= 3 && path_lower.split(&['\\', '/'][..])
+                                .any(|seg|
+                                    seg.starts_with(*word) ||
+                                    seg.split_whitespace().any(|seg_word|
+                                        seg_word.starts_with(*word) && seg_word.len() > word.len()
+                                    )
+                                ))
+                        }).count();
+
+                        // Distributed matches score higher (path + name)
+                        if name_matched >= 1 && path_matched >= 1 {
+                            4000i64 // HIGH priority: words distributed across path and name
+                        } else if name_matched > 0 || path_matched > 0 {
+                            2000i64 // Medium priority: all words in same location
+                        } else {
+                            1000i64 // Lower priority
+                        }
+                    } else {
+                        1000i64
+                    };
+
                     results.push((score, file));
                     if results.len() >= contains_limit { break; }
                 }
             }
         }
         
-        // Phase 4: LIMITED Fuzzy matching (only for short queries and if really needed)
+        // Phase 4: Multi-word fallback - if no multi-word results, search for most specific term
+        if is_multi_word && results.len() < 3 {
+            println!("FZF Debug: Multi-word search found few results ({}), falling back to single-word search", results.len());
+            
+            // Find the longest/most specific word to search for
+            let query_str = query_lower.as_str();
+            let fallback_word = query_words.iter()
+                .max_by_key(|word| word.len())
+                .unwrap_or(&query_str);
+            
+            println!("FZF Debug: Using fallback word '{}' for single-word search", fallback_word);
+            for (i, file) in self.files.iter().enumerate() {
+                if i > 25000 || results.len() >= limit { break; }
+                
+                let path_lower = file.path.to_lowercase();
+                let matches = file.name_lower.contains(fallback_word) || 
+                             path_lower.contains(fallback_word) ||
+                             path_lower.split('\\').chain(path_lower.split('/'))
+                                 .any(|segment| segment.contains(fallback_word));
+                
+                if matches && !results.iter().any(|(_, f): &(i64, &FileIndex)| f.path == file.path) {
+                    results.push((1500, file)); // Lower score than exact multi-word matches
+                    if results.len() >= limit { break; }
+                }
+            }
+        }
+        
+        // Phase 5: LIMITED Fuzzy matching (only for short queries and if really needed)
         if results.len() < limit && query.len() <= 10 && !is_multi_word {
             let fuzzy_limit = 10; // Very limited fuzzy results
             let mut fuzzy_checked = 0;

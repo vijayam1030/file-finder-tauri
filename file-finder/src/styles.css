@@ -1,3 +1,38 @@
+/* Loading spinner for search */
+.search-loading {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  background: var(--bg-secondary);
+  color: var(--accent);
+  text-align: center;
+  font-size: 16px;
+  font-weight: 500;
+  padding: 10px 0;
+  z-index: 1000;
+  box-shadow: 0 2px 8px var(--shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+.search-loading.hidden {
+  display: none;
+}
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 3px solid var(--accent);
+  border-top: 3px solid var(--bg-primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
 :root {
   --bg-primary: #1a1a1a;
   --bg-secondary: #2d2d2d;

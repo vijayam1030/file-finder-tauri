@@ -12,10 +12,12 @@ use chrono::Utc;
 
 mod llm_integration;
 mod fzf_search;
+mod simple_search;
 use regex::Regex;
 use std::collections::{HashSet, HashMap};
 use rayon::prelude::*;
 use fzf_search::FzfSearchEngine;
+use simple_search::SimpleSearchEngine;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchOptions {
@@ -90,6 +92,8 @@ pub struct AppState {
     llm_processor: llm_integration::LLMProcessor,
     // FZF-style in-memory search engine for real-time search
     fzf_engine: Mutex<FzfSearchEngine>,
+    // Simple, effective search engine using nucleo
+    simple_engine: Mutex<SimpleSearchEngine>,
 }
 
 // Fuzzy matching helper function
@@ -445,6 +449,7 @@ impl AppState {
             regex_cache: Mutex::new(HashMap::new()),
             llm_processor: llm_integration::LLMProcessor::new(),
             fzf_engine: Mutex::new(fzf_engine),
+            simple_engine: Mutex::new(SimpleSearchEngine::new()),
         })
     }
 }
@@ -458,7 +463,9 @@ async fn start_indexing(_state: State<'_, AppState>) -> Result<String, String> {
     // Spawn a background task for indexing
     tauri::async_runtime::spawn(async move {
         println!("Starting background indexing task...");
-        index_directory(&home_dir, true).await;
+        if let Err(e) = index_directory(&home_dir, true).await {
+            eprintln!("Indexing error: {}", e);
+        }
         println!("Background indexing task completed");
     });
 
@@ -481,14 +488,16 @@ async fn index_custom_folder(path: String, _state: State<'_, AppState>) -> Resul
     // Spawn a background task for indexing (don't clear existing files)
     tauri::async_runtime::spawn(async move {
         println!("Starting background indexing for custom folder...");
-        index_directory(&folder_path, false).await;
+        if let Err(e) = index_directory(&folder_path, false).await {
+            eprintln!("Indexing error: {}", e);
+        }
         println!("Background indexing for custom folder completed");
     });
 
     Ok(format!("Indexing folder: {}", path))
 }
 
-async fn index_directory(path: &Path, clear_existing: bool) {
+async fn index_directory(path: &Path, clear_existing: bool) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("file-finder")
@@ -498,7 +507,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);
-            return;
+            return Err(Box::new(e));
         }
     };
 
@@ -526,7 +535,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
         // Full reindex - clear all files from this directory
         if let Err(e) = conn.execute("DELETE FROM files WHERE root_directory = ?1", [&root_dir_str]) {
             eprintln!("Failed to clear existing files for directory: {}", e);
-            return;
+            return Ok(());
         }
         println!("Cleared existing index for directory: {}, starting fresh...", root_dir_str);
     } else if already_indexed {
@@ -639,7 +648,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
     
     if total_count == 0 {
         println!("No new files to index.");
-        return;
+        return Ok(());
     }
     
     println!("Found {} new items to insert into database...", total_count);
@@ -649,7 +658,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Failed to start transaction: {}", e);
-            return;
+            return Ok(());
         }
     };
 
@@ -659,7 +668,7 @@ async fn index_directory(path: &Path, clear_existing: bool) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to prepare statement: {}", e);
-            return;
+            return Ok(());
         }
     };
 
@@ -682,10 +691,33 @@ async fn index_directory(path: &Path, clear_existing: bool) {
     // Commit the transaction
     if let Err(e) = tx.commit() {
         eprintln!("Failed to commit transaction: {}", e);
-        return;
+        return Ok(());
     }
 
     println!("Indexing complete! Added {} new files (skipped {} existing)", inserted_count, total_count - inserted_count);
+
+        // Show total number of files indexed in the database
+        match conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE root_directory = ?1",
+            [&root_dir_str],
+            |row| row.get::<_, i64>(0)
+        ) {
+            Ok(count) => println!("Total files indexed for '{}': {}", root_dir_str, count),
+            Err(e) => eprintln!("Failed to count indexed files: {}", e),
+        }
+
+        // Create FTS5 virtual table for fast full-text search
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(name, path, content='files', content_rowid='id');",
+            [],
+        )?;
+        // Sync FTS table with files table (for new/updated files)
+        conn.execute(
+            "INSERT INTO files_fts(rowid, name, path) SELECT id, name, path FROM files WHERE id NOT IN (SELECT rowid FROM files_fts);",
+            [],
+        )?;
+    
+    Ok(())
 }
 
 // Helper function to normalize strings by removing separators for better matching
@@ -905,9 +937,6 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
 
     results
 }
-
-
-
 
 #[tauri::command]
 async fn search_files(query: String, options: Option<SearchOptions>, state: State<'_, AppState>) -> Result<Vec<FileEntry>, String> {
@@ -1190,6 +1219,63 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
 
         (files, recent, favorites)
     }; // Database lock is automatically released here
+
+    // ENHANCED: For multi-word queries, try SQLite FTS5 first for better results
+    if query.contains(' ') && !query.contains('.') { // Multi-word queries without file extensions
+        println!("Multi-word query detected, trying SQLite FTS5 search for: '{}'", query);
+        
+        let fts_results = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            let fts_query = format!("{}*", query.replace(' ', "* "));
+            let fts_sql = "SELECT files.path, files.name, files.modified_at 
+                          FROM files_fts 
+                          JOIN files ON files_fts.rowid = files.id 
+                          WHERE files_fts MATCH ? 
+                          ORDER BY rank 
+                          LIMIT 100";
+            
+            let mut fts_stmt = db.prepare(fts_sql).map_err(|e| e.to_string())?;
+            let fts_rows = fts_stmt.query_map([&fts_query], |row| {
+                Ok(FileEntry {
+                    path: row.get::<_, String>(0)?,
+                    name: row.get::<_, String>(1)?,
+                    modified_at: row.get::<_, Option<i64>>(2)?,
+                    last_accessed: None,
+                    access_count: 0,
+                })
+            }).map_err(|e| e.to_string())?;
+            
+            let mut fts_results = Vec::new();
+            for row in fts_rows {
+                if let Ok(r) = row {
+                    fts_results.push(r);
+                }
+            }
+            fts_results
+        };
+        
+        if !fts_results.is_empty() {
+            println!("SQLite FTS5 found {} results for multi-word query", fts_results.len());
+            
+            // Cache the results
+            {
+                let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
+                if cache.len() >= 100 {
+                    let oldest_key = cache.iter()
+                        .min_by_key(|(_, (timestamp, _))| timestamp)
+                        .map(|(key, _)| key.clone());
+                    if let Some(key) = oldest_key {
+                        cache.remove(&key);
+                    }
+                }
+                cache.insert(cache_key, (Instant::now(), fts_results.clone()));
+            }
+            
+            return Ok(fts_results);
+        } else {
+            println!("SQLite FTS5 found no results, falling back to regular search");
+        }
+    }
 
     // Analyze the query pattern using our unified pattern analyzer
     let pattern_info = analyze_regex_pattern(&query);
@@ -1617,22 +1703,83 @@ async fn fzf_search(state: State<'_, AppState>, query: String, limit: Option<usi
         println!("  Result {}: score={} name='{}' path='{}'", i, score, file.name, file.path);
     }
     
-    // Aggressive filtering: eliminate UE "0" folder spam unless specifically searching for "0"
-    let filtered_results: Vec<_> = if query != "0" && query != "0/" && !query.to_lowercase().contains("external") {
+    // Aggressive filtering: eliminate system junk folders unless specifically searching for them
+    let filtered_results: Vec<_> = if !query.chars().all(|c| c.is_ascii_digit()) && query != "0" && query != "r" {
         results.into_iter()
             .filter(|(score, file)| {
-                // Remove ALL Unreal Engine __External* "0" folders for better user experience
-                !(file.name == "0" && file.path.contains("__External") && *score <= 3000)
+                // Remove junk system folders for better user experience
+                let is_junk_folder = 
+                    // UE External folders
+                    (file.name == "0" && file.path.contains("__External")) ||
+                    // Browser cache/temp folders (numbered folders in browser paths)
+                    (file.name.chars().all(|c| c.is_ascii_digit()) && 
+                     (file.path.contains("Browser") || file.path.contains("cache") || file.path.contains("morgue"))) ||
+                    // Windows WinSxS system folders (single letter folders)
+                    (file.name.len() == 1 && file.name.chars().all(|c| c.is_ascii_lowercase()) && 
+                     file.path.contains("WinSxS")) ||
+                    // Tor Browser temp folders
+                    (file.name.chars().all(|c| c.is_ascii_digit()) && file.path.contains("Tor Browser")) ||
+                    // Other low-score system junk
+                    (*score <= 2000 && 
+                     (file.path.contains("UpdateInfo") || file.path.contains("profile.default") || 
+                      file.path.contains("uuid+++") || file.name.len() <= 2));
+                
+                !is_junk_folder
             })
             .collect()
     } else {
-        results // Keep all results if specifically searching for "0" or "external"
+        results // Keep all results if specifically searching for numbers/letters
     };
     
     println!("FZF Debug: After filtering: {} results", filtered_results.len());
     
+    // Multi-word fallback: if filtering removed all results from multi-word search, try single-word search
+    let final_results = if filtered_results.is_empty() && query.contains(' ') {
+        println!("FZF Debug: Multi-word search filtered to 0 results, trying single-word fallback");
+        
+        // Find the longest/most specific word for fallback
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let query_str = query.as_str();
+        let fallback_word = words.iter()
+            .max_by_key(|word| word.len())
+            .unwrap_or(&query_str);
+            
+        println!("FZF Debug: Using fallback word '{}' for single-word search", fallback_word);
+        
+        // Perform single-word search with the most specific term
+        let fallback_results = fzf_engine.search(fallback_word, limit.unwrap_or(20));
+        
+        // Apply the same filtering to fallback results, but be less aggressive for fuzzy matches
+        let filtered_fallback: Vec<_> = if !fallback_word.chars().all(|c| c.is_ascii_digit()) && *fallback_word != "0" && *fallback_word != "r" {
+            fallback_results.into_iter()
+                .filter(|(score, file)| {
+                    let is_junk_folder = 
+                        (file.name == "0" && file.path.contains("__External")) ||
+                        (file.name.chars().all(|c| c.is_ascii_digit()) && 
+                         (file.path.contains("Browser") || file.path.contains("cache") || file.path.contains("morgue"))) ||
+                        (file.name.len() == 1 && file.name.chars().all(|c| c.is_ascii_lowercase()) && 
+                         file.path.contains("WinSxS")) ||
+                        (file.name.chars().all(|c| c.is_ascii_digit()) && file.path.contains("Tor Browser")) ||
+                        // Be less aggressive with score filtering for fuzzy fallback results
+                        (*score <= 1000 && 
+                         (file.path.contains("UpdateInfo") || file.path.contains("profile.default") || 
+                          file.path.contains("uuid+++") || (file.name.len() <= 2 && file.name.chars().all(|c| c.is_ascii_digit()))));
+                    
+                    !is_junk_folder
+                })
+                .collect()
+        } else {
+            fallback_results
+        };
+        
+        println!("FZF Debug: Fallback search found {} results after filtering", filtered_fallback.len());
+        filtered_fallback
+    } else {
+        filtered_results
+    };
+    
     // Convert to expected format (path, name, modified_at)
-    let formatted_results: Vec<(String, String, Option<i64>)> = filtered_results
+    let formatted_results: Vec<(String, String, Option<i64>)> = final_results
         .into_iter()
         .map(|(_score, file)| (file.path.clone(), file.name.clone(), file.modified_at))
         .collect();
@@ -1975,6 +2122,93 @@ struct IndexStatus {
     last_indexed: Option<i64>,
 }
 
+#[tauri::command]
+async fn simple_search(
+    query: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>
+) -> Result<Vec<(String, String, Option<i64>)>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let limit = limit.unwrap_or(20);
+    
+    // Load files into simple engine if not already loaded
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let mut simple_engine = state.simple_engine.lock().map_err(|e| e.to_string())?;
+        
+        // Load files if engine is empty
+        if simple_engine.files.is_empty() {
+            println!("Loading files into simple search engine...");
+            
+            let mut stmt = db.prepare("SELECT name, path, modified_at FROM files ORDER BY length(name), name")
+                .map_err(|e| e.to_string())?;
+            
+            let mapped_rows = stmt.query_map([], |row| {
+                let name: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let modified_at: Option<i64> = row.get(2)?;
+                
+                Ok(fzf_search::FileIndex {
+                    name_lower: name.to_lowercase(),
+                    name,
+                    path,
+                    modified_at,
+                })
+            }).map_err(|e| e.to_string())?;
+            
+            simple_engine.files = mapped_rows.filter_map(|r| r.ok()).collect();
+            println!("Simple Search: Loaded {} files", simple_engine.files.len());
+        }
+    }
+    
+    // Perform the search
+    let results = {
+        let mut simple_engine = state.simple_engine.lock().map_err(|e| e.to_string())?;
+        
+        // Use multi-word search for better results
+        if query.contains(' ') {
+            simple_engine.multi_word_search(&query, limit)
+        } else {
+            simple_engine.search(&query, limit)
+        }
+    };
+    
+    // Apply the same filtering as FZF search to remove junk folders
+    let filtered_results: Vec<_> = if !query.chars().all(|c| c.is_ascii_digit()) && query != "0" && query != "r" {
+        results.into_iter()
+            .filter(|(score, file)| {
+                let is_junk_folder = 
+                    (file.name == "0" && file.path.contains("__External")) ||
+                    (file.name.chars().all(|c| c.is_ascii_digit()) && 
+                     (file.path.contains("Browser") || file.path.contains("cache") || file.path.contains("morgue"))) ||
+                    (file.name.len() == 1 && file.name.chars().all(|c| c.is_ascii_lowercase()) && 
+                     file.path.contains("WinSxS")) ||
+                    (file.name.chars().all(|c| c.is_ascii_digit()) && file.path.contains("Tor Browser")) ||
+                    (*score <= 1000 && 
+                     (file.path.contains("UpdateInfo") || file.path.contains("profile.default") || 
+                      file.path.contains("uuid+++") || (file.name.len() <= 2 && file.name.chars().all(|c| c.is_ascii_digit()))));
+                
+                !is_junk_folder
+            })
+            .collect()
+    } else {
+        results
+    };
+    
+    println!("Simple Search: After filtering: {} results", filtered_results.len());
+    
+    // Convert to expected format
+    let formatted_results: Vec<(String, String, Option<i64>)> = filtered_results
+        .into_iter()
+        .map(|(_score, file)| (file.path.clone(), file.name.clone(), file.modified_at))
+        .collect();
+    
+    Ok(formatted_results)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState::new().expect("Failed to initialize app state");
@@ -1988,6 +2222,7 @@ pub fn run() {
             index_custom_folder,
             search_files,
             fzf_search,
+            simple_search,
             refresh_fzf_index,
             natural_language_search,
             get_recent_files,

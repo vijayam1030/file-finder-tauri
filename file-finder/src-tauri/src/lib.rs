@@ -1123,35 +1123,35 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             if let Some(sql_pattern) = &pattern_info.sql_like_pattern {
                 let (base_query_sql, limit) = match pattern_info.pattern_type {
                     PatternType::SimpleGlob if pattern_info.suffix.is_some() => {
-                        // EMERGENCY FIX: Ultra-low limits for 1.5M files
+                        // Reasonable limits for glob patterns
                         if search_opts.applications_only {
-                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 50)
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 500)
                         } else {
-                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 50)
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 500)
                         }
                     },
                     PatternType::SimplePrefix => {
-                        // EMERGENCY FIX: Much smaller limit
+                        // Good limit for prefix searches
                         if search_opts.applications_only {
-                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 100)
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1 AND LOWER(name) LIKE '%.exe'", 1000)
                         } else {
-                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 100)
+                            ("SELECT path, name, modified_at FROM files WHERE name LIKE ?1", 1000)
                         }
                     },
                     PatternType::LiteralSearch if query.contains(' ') => {
-                        // EMERGENCY FIX: Tiny limit for multi-word searches
+                        // Balanced limit for multi-word searches
                         if search_opts.applications_only {
-                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 30)
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 300)
                         } else {
-                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 30)
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 300)
                         }
                     },
                     _ => {
-                        // EMERGENCY FIX: Minimal limit for other patterns
+                        // Standard limit for literal searches
                         if search_opts.applications_only {
-                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 25)
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1) AND LOWER(name) LIKE '%.exe'", 800)
                         } else {
-                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 25)
+                            ("SELECT path, name, modified_at FROM files WHERE LOWER(name) LIKE LOWER(?1)", 800)
                         }
                     }
                 };

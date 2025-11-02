@@ -23,6 +23,34 @@ let searchOptions = {
   applications_only: false
 };
 
+// Update the active settings display
+function updateActiveSettingsDisplay() {
+  const settingsTagsEl = document.getElementById('settings-tags');
+  if (!settingsTagsEl) return;
+  
+  const activeSettings = [];
+  
+  // Check each setting and add to active list
+  if (searchOptions.search_folders) activeSettings.push('Folders');
+  if (searchOptions.enable_fuzzy) activeSettings.push('Fuzzy');
+  if (searchOptions.strict_mode) activeSettings.push('Strict');
+  if (searchOptions.filename_only) activeSettings.push('Name Only');
+  if (searchOptions.applications_only) activeSettings.push('Apps Only');
+  
+  // Create the HTML
+  let html = '';
+  if (activeSettings.length > 0) {
+    html = `<span class="settings-label">Active:</span>`;
+    activeSettings.forEach(setting => {
+      html += `<span class="settings-tag">${setting}</span>`;
+    });
+  } else {
+    html = `<span class="settings-label">Settings:</span><span class="settings-tag disabled">None Active</span>`;
+  }
+  
+  settingsTagsEl.innerHTML = html;
+}
+
 // Sort options
 let currentSort = {
   search: 'relevance',  // relevance, date, usage
@@ -230,26 +258,31 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Setup settings checkboxes
   document.getElementById("search-folders").addEventListener("change", (e) => {
     searchOptions.search_folders = e.target.checked;
+    updateActiveSettingsDisplay();
     performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-fuzzy").addEventListener("change", (e) => {
     searchOptions.enable_fuzzy = e.target.checked;
+    updateActiveSettingsDisplay();
     performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-strict").addEventListener("change", (e) => {
     searchOptions.strict_mode = e.target.checked;
+    updateActiveSettingsDisplay();
     performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("search-filename-only").addEventListener("change", (e) => {
     searchOptions.filename_only = e.target.checked;
+    updateActiveSettingsDisplay();
     performFzfSearch(searchInput.value.trim());
   });
   
   document.getElementById("applications-only").addEventListener("change", (e) => {
     searchOptions.applications_only = e.target.checked;
+    updateActiveSettingsDisplay();
     performFzfSearch(searchInput.value.trim());
   });
   
@@ -302,6 +335,9 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Load initial status
   await updateStatus();
+  
+  // Initialize active settings display
+  updateActiveSettingsDisplay();
   
   // Load recent files and favorites
   await loadRecentFiles();

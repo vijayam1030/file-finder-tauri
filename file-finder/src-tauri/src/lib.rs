@@ -750,8 +750,9 @@ fn fuzzy_search_files(files: Vec<(String, String)>, query: &str, recent: &[Strin
     // Normalized query (no separators) for matching "finduname" to "find-uname"
     let query_normalized = normalize_for_matching(query_trimmed);
 
-    // Early termination for fuzzy search - only process first 300 files for performance
-    for (path, name) in files.into_iter().take(300) {
+    // Early termination for fuzzy search - process more files if query looks like it needs normalization
+    let search_limit = if query_normalized != query_trimmed.to_lowercase().replace(' ', "") { 1000 } else { 300 };
+    for (path, name) in files.into_iter().take(search_limit) {
         let name_l = name.to_lowercase();
         let path_l = path.to_lowercase();
         let name_normalized = normalize_for_matching(&name);
@@ -1221,7 +1222,11 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
     }; // Database lock is automatically released here
 
     // ENHANCED: For multi-word queries, try SQLite FTS5 first for better results
-    if query.contains(' ') && !query.contains('.') { // Multi-word queries without file extensions
+    // BUT: Skip FTS5 for date-like patterns (e.g., "Harry 07312025") and use fuzzy search instead
+    let looks_like_date_query = query.chars().any(|c| c.is_ascii_digit()) && 
+                               query.split_whitespace().any(|word| word.chars().all(|c| c.is_ascii_digit()) && word.len() >= 6);
+    
+    if query.contains(' ') && !query.contains('.') && !looks_like_date_query { // Multi-word queries without file extensions or dates
         println!("Multi-word query detected, trying SQLite FTS5 search for: '{}'", query);
         
         let fts_results = {
@@ -1322,7 +1327,76 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
             
             return Ok(fts_results);
         } else {
-            println!("SQLite FTS5 found no results, falling back to regular search");
+            println!("SQLite FTS5 found no results, falling back to fuzzy search with normalization");
+            
+            // For multi-word queries that failed FTS5, try fuzzy search with normalization
+            // This handles cases like "Harry 07312025" matching "Harry_07-31-2025"
+            let files_2tuple: Vec<(String, String)> = files.clone().into_iter().map(|(path, name, _)| (path, name)).collect();
+            let fuzzy_results = fuzzy_search_files(files_2tuple, &query, &recent, &favorites, &search_opts);
+            
+            if !fuzzy_results.is_empty() {
+                println!("Fuzzy search found {} results for multi-word query", fuzzy_results.len());
+                
+                // Cache and return fuzzy results
+                let fuzzy_entries: Vec<FileEntry> = fuzzy_results.into_iter().map(|(_, entry)| entry).collect();
+                {
+                    let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
+                    if cache.len() >= 100 {
+                        let oldest_key = cache.iter()
+                            .min_by_key(|(_, (timestamp, _))| timestamp)
+                            .map(|(key, _)| key.clone());
+                        if let Some(key) = oldest_key {
+                            cache.remove(&key);
+                        }
+                    }
+                    cache.insert(cache_key, (Instant::now(), fuzzy_entries.clone()));
+                }
+                return Ok(fuzzy_entries);
+            }
+        }
+    } else if looks_like_date_query {
+        println!("Date-like query detected ('{}'), using enhanced search with normalization", query);
+        
+        // For date-like queries, first try to pre-filter files that might match
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let first_word = words.get(0).unwrap_or(&query.as_str()).to_lowercase();
+        
+        // Pre-filter files that contain the first word (usually the name part)
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let prefiltered_files: Vec<(String, String)> = {
+            let mut stmt = db.prepare("SELECT path, name FROM files WHERE LOWER(name) LIKE ? LIMIT 2000")
+                .map_err(|e| e.to_string())?;
+            let pattern = format!("%{}%", first_word);
+            let results: Vec<(String, String)> = stmt.query_map([&pattern], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            results
+        };
+        
+        println!("Pre-filtered {} files containing '{}' for date-like search", prefiltered_files.len(), first_word);
+        
+        // Now apply fuzzy search with normalization to the pre-filtered set
+        let fuzzy_results = fuzzy_search_files(prefiltered_files, &query, &recent, &favorites, &search_opts);
+        
+        if !fuzzy_results.is_empty() {
+            println!("Fuzzy search found {} results for date-like query", fuzzy_results.len());
+            
+            // Cache and return fuzzy results
+            let fuzzy_entries: Vec<FileEntry> = fuzzy_results.into_iter().map(|(_, entry)| entry).collect();
+            {
+                let mut cache = state.search_cache.lock().map_err(|e| e.to_string())?;
+                if cache.len() >= 100 {
+                    let oldest_key = cache.iter()
+                        .min_by_key(|(_, (timestamp, _))| timestamp)
+                        .map(|(key, _)| key.clone());
+                    if let Some(key) = oldest_key {
+                        cache.remove(&key);
+                    }
+                }
+                cache.insert(cache_key, (Instant::now(), fuzzy_entries.clone()));
+            }
+            return Ok(fuzzy_entries);
         }
     }
 

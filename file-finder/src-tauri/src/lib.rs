@@ -1226,32 +1226,81 @@ async fn search_files(query: String, options: Option<SearchOptions>, state: Stat
         
         let fts_results = {
             let db = state.db.lock().map_err(|e| e.to_string())?;
-            let fts_query = format!("{}*", query.replace(' ', "* "));
-            let fts_sql = "SELECT files.path, files.name, files.modified_at 
-                          FROM files_fts 
-                          JOIN files ON files_fts.rowid = files.id 
-                          WHERE files_fts MATCH ? 
-                          ORDER BY rank 
-                          LIMIT 100";
             
-            let mut fts_stmt = db.prepare(fts_sql).map_err(|e| e.to_string())?;
-            let fts_rows = fts_stmt.query_map([&fts_query], |row| {
-                Ok(FileEntry {
-                    path: row.get::<_, String>(0)?,
-                    name: row.get::<_, String>(1)?,
-                    modified_at: row.get::<_, Option<i64>>(2)?,
-                    last_accessed: None,
-                    access_count: 0,
-                })
-            }).map_err(|e| e.to_string())?;
+            // First check if FTS table exists and has data
+            let fts_count: i64 = match db.query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0)) {
+                Ok(count) => count,
+                Err(e) => {
+                    println!("FTS5 table check failed: {}, will populate it", e);
+                    // Try to create and populate FTS5 table
+                    if let Err(create_err) = db.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(name, path, content='files', content_rowid='id');",
+                        [],
+                    ) {
+                        println!("Failed to create FTS5 table: {}", create_err);
+                        0
+                    } else if let Err(populate_err) = db.execute(
+                        "INSERT INTO files_fts(rowid, name, path) SELECT id, name, path FROM files WHERE id NOT IN (SELECT rowid FROM files_fts);",
+                        [],
+                    ) {
+                        println!("Failed to populate FTS5 table: {}", populate_err);
+                        0
+                    } else {
+                        // Get count after population
+                        db.query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0)).unwrap_or(0)
+                    }
+                }
+            };
             
-            let mut fts_results = Vec::new();
-            for row in fts_rows {
-                if let Ok(r) = row {
-                    fts_results.push(r);
+            println!("FTS5 table has {} entries", fts_count);
+            
+            if fts_count == 0 {
+                println!("FTS5 table is empty, skipping FTS search");
+                Vec::new()
+            } else {
+                let fts_query = format!("{}*", query.replace(' ', "* "));
+                println!("FTS5 query: '{}'", fts_query);
+                
+                let fts_sql = "SELECT files.path, files.name, files.modified_at 
+                              FROM files_fts 
+                              JOIN files ON files_fts.rowid = files.id 
+                              WHERE files_fts MATCH ? 
+                              ORDER BY rank 
+                              LIMIT 100";
+                
+                match db.prepare(fts_sql) {
+                    Ok(mut fts_stmt) => {
+                        match fts_stmt.query_map([&fts_query], |row| {
+                            Ok(FileEntry {
+                                path: row.get::<_, String>(0)?,
+                                name: row.get::<_, String>(1)?,
+                                modified_at: row.get::<_, Option<i64>>(2)?,
+                                last_accessed: None,
+                                access_count: 0,
+                            })
+                        }) {
+                            Ok(fts_rows) => {
+                                let mut fts_results = Vec::new();
+                                for row in fts_rows {
+                                    if let Ok(r) = row {
+                                        fts_results.push(r);
+                                    }
+                                }
+                                println!("FTS5 raw query returned {} results", fts_results.len());
+                                fts_results
+                            }
+                            Err(e) => {
+                                println!("Failed to execute FTS5 query: {}", e);
+                                Vec::new()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to prepare FTS5 query: {}", e);
+                        Vec::new()
+                    }
                 }
             }
-            fts_results
         };
         
         if !fts_results.is_empty() {
